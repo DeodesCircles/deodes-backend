@@ -5,9 +5,12 @@
 .env
 !config/config.yaml
 config/keys/
+config/pg-certs/
 node_modules/
 .next/
 *.log
 /tmp/
 *.prod.yml
 /indexer
+
+.env.db

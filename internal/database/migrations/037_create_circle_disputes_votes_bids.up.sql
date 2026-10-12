@@ -10,8 +10,9 @@ CREATE TABLE IF NOT EXISTS disputes (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_disputes_circle_id ON disputes(circle_id);
-CREATE UNIQUE INDEX idx_disputes_idempotency ON disputes(idempotency_key) WHERE idempotency_key IS NOT NULL;
+ALTER TABLE disputes ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(100);
+CREATE INDEX IF NOT EXISTS idx_disputes_circle_id ON disputes(circle_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_disputes_idempotency ON disputes(idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS circle_votes (
     id UUID PRIMARY KEY,
@@ -24,8 +25,9 @@ CREATE TABLE IF NOT EXISTS circle_votes (
     UNIQUE (circle_id, voter_id, round_number)
 );
 
-CREATE INDEX idx_circle_votes_circle_round ON circle_votes(circle_id, round_number);
-CREATE UNIQUE INDEX idx_circle_votes_idempotency ON circle_votes(idempotency_key) WHERE idempotency_key IS NOT NULL;
+ALTER TABLE circle_votes ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(100);
+CREATE INDEX IF NOT EXISTS idx_circle_votes_circle_round ON circle_votes(circle_id, round_number);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_circle_votes_idempotency ON circle_votes(idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS circle_auction_bids (
     id UUID PRIMARY KEY,
@@ -38,5 +40,6 @@ CREATE TABLE IF NOT EXISTS circle_auction_bids (
     UNIQUE (circle_id, bidder_id, round_number)
 );
 
-CREATE INDEX idx_circle_auction_bids_circle_round ON circle_auction_bids(circle_id, round_number);
-CREATE UNIQUE INDEX idx_circle_auction_bids_idempotency ON circle_auction_bids(idempotency_key) WHERE idempotency_key IS NOT NULL;
+ALTER TABLE circle_auction_bids ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(100);
+CREATE INDEX IF NOT EXISTS idx_circle_auction_bids_circle_round ON circle_auction_bids(circle_id, round_number);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_circle_auction_bids_idempotency ON circle_auction_bids(idempotency_key) WHERE idempotency_key IS NOT NULL;

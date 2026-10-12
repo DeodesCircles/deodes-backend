@@ -1,0 +1,61 @@
+name: deodes-deps
+
+# Dedicated Postgres + Redis for the DEODES API. Loopback-bound ports so
+# nothing else on the host can reach them; named volumes persist data.
+# NOT on the edge network — only the API talks to these (via 172.17.0.1
+# from Docker, or 127.0.0.1 from the host binary).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    command: ["postgres", "-c", "ssl=on", "-c", "ssl_cert_file=/certs/server.crt", "-c", "ssl_key_file=/certs/server.key"]
+    environment:
+      POSTGRES_USER: deodes
+      POSTGRES_PASSWORD: ${DEODES_DB_PASSWORD:?set DEODES_DB_PASSWORD}
+      POSTGRES_DB: deodes
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - deodes_pg:/var/lib/postgresql/data
+      - /root/deodes-backend/config/pg-certs:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deodes -d deodes"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.4.2-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${DEODES_REDIS_PASSWORD:?set DEODES_REDIS_PASSWORD}"]
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - deodes_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${DEODES_REDIS_PASSWORD:?set DEODES_REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.13-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: deodes
+      RABBITMQ_DEFAULT_PASS: ${DEODES_RABBITMQ_PASSWORD:?set DEODES_RABBITMQ_PASSWORD}
+    ports:
+      - "127.0.0.1:5673:5672"
+    volumes:
+      - deodes_rabbit:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  deodes_pg:
+  deodes_redis:
+  deodes_rabbit:

@@ -24,7 +24,14 @@ CREATE INDEX IF NOT EXISTS idx_contributions_circle_round ON contributions(circl
 -- idx_swap_offers_expires_at (migration 035) are separate single-column
 -- indexes; a composite matching this exact predicate avoids Postgres having
 -- to bitmap-AND two index scans on every sweep.
-CREATE INDEX IF NOT EXISTS idx_swap_offers_status_expires ON swap_offers(status, expires_at);
+-- NOTE: swap_offers is created by migration 042, which sorts after this file.
+-- Guard with to_regclass so this stays re-runnable in both orders.
+DO $$
+BEGIN
+  IF to_regclass('public.swap_offers') IS NOT NULL THEN
+    CREATE INDEX IF NOT EXISTS idx_swap_offers_status_expires ON swap_offers(status, expires_at);
+  END IF;
+END $$;
 
 -- notifications(user_id, is_read) (migration 008) and incentives(user_id)
 -- (migration 031) — both named in the issue — already exist and already

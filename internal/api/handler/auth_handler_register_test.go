@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
@@ -361,4 +362,89 @@ func TestAuthHandler_RegisterVerify_BadCode(t *testing.T) {
 	r.ServeHTTP(w2, req2)
 
 	assert.Equal(t, 400, w2.Code)
+}
+
+func loginTestUser(t *testing.T, verified bool) *user.User {
+	t.Helper()
+	hash, err := auth.HashPassword("SuperSecret123!")
+	assert.NoError(t, err)
+	return &user.User{
+		ID:            uuid.New(),
+		Role:          user.RoleUser,
+		EmailVerified: verified,
+		PasswordHash:  sql.NullString{String: hash, Valid: true},
+	}
+}
+
+func TestAuthHandler_Login_Success(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	env := newRegisterEnv(t)
+
+	u := loginTestUser(t, true)
+	env.mockUserRepo.On("FindByEmail", mock.Anything, testEmail).Return(u, nil)
+	env.mockAuthSvc.On("CreateSession", mock.Anything, u.ID, mock.Anything, mock.Anything, mock.Anything).Return(
+		&auth.TokenPair{AccessToken: "jwt-token", RefreshToken: "refresh-token", CSRFToken: "csrf-token"}, nil,
+	)
+
+	r := gin.New()
+	r.POST("/v1/auth/login", env.handler.Login)
+
+	body, _ := json.Marshal(map[string]string{
+		"email":    testEmail,
+		"password": "SuperSecret123!",
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/auth/login", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, 200, w.Code)
+	assert.Contains(t, w.Body.String(), "jwt-token")
+	env.mockAuthSvc.AssertExpectations(t)
+	env.mockUserRepo.AssertExpectations(t)
+}
+
+func TestAuthHandler_Login_BadPassword(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	env := newRegisterEnv(t)
+
+	u := loginTestUser(t, true)
+	env.mockUserRepo.On("FindByEmail", mock.Anything, testEmail).Return(u, nil)
+
+	r := gin.New()
+	r.POST("/v1/auth/login", env.handler.Login)
+
+	body, _ := json.Marshal(map[string]string{
+		"email":    testEmail,
+		"password": "WrongPassword123!",
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/auth/login", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, 401, w.Code)
+	assert.NotContains(t, w.Body.String(), "jwt-token")
+}
+
+func TestAuthHandler_Login_Unverified(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	env := newRegisterEnv(t)
+
+	u := loginTestUser(t, false)
+	env.mockUserRepo.On("FindByEmail", mock.Anything, testEmail).Return(u, nil)
+
+	r := gin.New()
+	r.POST("/v1/auth/login", env.handler.Login)
+
+	body, _ := json.Marshal(map[string]string{
+		"email":    testEmail,
+		"password": "SuperSecret123!",
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/auth/login", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, 403, w.Code)
 }

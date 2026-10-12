@@ -130,6 +130,7 @@ func NewRouter(
 		{
 			auth.POST("/register", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.Register)
 			auth.POST("/register/verify", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.RegisterVerify)
+			auth.POST("/login", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.Login)
 			auth.POST("/refresh", middleware.RefreshTokenBlocklistMiddleware(redisClient), authHandler.Refresh)
 			auth.POST("/nonce", authHandler.Nonce)
 			auth.POST("/verify", authHandler.Verify)

@@ -49,6 +49,58 @@ func emailWalletAddress(email string) string {
 // Register starts the email-based registration flow. It accepts an email +
 // password, checks for existing accounts, and dispatches a 6-digit OTP to the
 // provided email address. The pending registration is stored in Redis until
+// Login authenticates with email + password for accounts created through
+// Register/RegisterVerify. Returns a session pair on success.
+//
+// @Summary Email + password login
+// @Tags Authentication
+// @Accept json
+// @Produce json
+// @Param body body object true "Login payload" {"email":"string","password":"string"}
+// @Success 200 {object} response.Envelope
+// @Failure 400 {object} response.Envelope
+// @Failure 401 {object} response.Envelope
+// @Failure 403 {object} response.Envelope
+// @Router /auth/login [post]
+func (h *RegistrationHandler) Login(c *gin.Context) {
+	var req struct {
+		Email    string `json:"email" binding:"required,email"`
+		Password string `json:"password" binding:"required,min=8"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	u, err := h.userRepo.FindByEmail(c.Request.Context(), req.Email)
+	if err != nil {
+		// Same message as a bad password: account existence is not revealed.
+		response.InvalidCredentials(c, "invalid email or password")
+		return
+	}
+	if !u.EmailVerified {
+		response.Forbidden(c, "verify your email first — check your inbox for the code")
+		return
+	}
+	if !u.PasswordHash.Valid || !auth.VerifyPassword(req.Password, u.PasswordHash.String) {
+		response.InvalidCredentials(c, "invalid email or password")
+		return
+	}
+
+	ctx := c.Request.Context()
+	pair, err := h.authService.CreateSession(ctx, u.ID, string(u.Role), sessionTTLFromUser(u), deviceInfoFromContext(c))
+	if err != nil {
+		response.InternalError(c, "failed to create session")
+		return
+	}
+
+	response.OK(c, gin.H{
+		"token":        pair.AccessToken,
+		"refreshToken": pair.RefreshToken,
+		"csrfToken":    pair.CSRFToken,
+	})
+}
+
 // RegisterVerify confirms the OTP.
 //
 // Email is stored using user.HashEmail (full SHA-256 hex) — the single

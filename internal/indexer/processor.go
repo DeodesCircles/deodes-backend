@@ -1,0 +1,1248 @@
+package indexer
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/rs/zerolog/log"
+	"github.com/stellar/go/strkey"
+
+	"github.com/deodes/backend/internal/domain/circle"
+	"github.com/deodes/backend/internal/domain/contribution"
+	"github.com/deodes/backend/internal/domain/payout"
+	"github.com/deodes/backend/internal/domain/reputation"
+	"github.com/deodes/backend/internal/domain/user"
+	"github.com/deodes/backend/pkg/apperrors"
+	"github.com/deodes/backend/pkg/rabbitmq"
+)
+
+// EventProcessor maps Stellar transactions to domain events, persists them
+// to PostgreSQL, broadcasts real-time updates via WebSocket, and publishes
+// events to RabbitMQ for async workers.
+type EventProcessor struct {
+	db             *sqlx.DB
+	rmqClient      *rabbitmq.Client
+	circleRepo     circle.Repository
+	contribRepo    contribution.Repository
+	payoutRepo     payout.Repository
+	reputationRepo reputation.Repository
+	userRepo       user.Repository
+	wsBroadcast    func(circleID string, data any)
+
+	// knownContracts is the set of contract IDs the indexer decodes events for.
+	// Events from any other contract are skipped and recorded, never dispatched.
+	knownContracts map[string]struct{}
+	unknownEvents  prometheus.Counter
+
+	// versions resolves the deployed version of the contract that emitted an
+	// event, so the audit log can attribute an event to the code that produced
+	// it across upgrades. May be nil, in which case every event is recorded
+	// with ContractVersionUnknown.
+	versions       ContractVersionResolver
+	versionUnknown prometheus.Counter
+
+	// events holds the per-event-type counters. May be nil, in which case no
+	// per-type counting happens.
+	events *EventCounters
+}
+
+// NewEventProcessor creates a new EventProcessor with all required dependencies.
+func NewEventProcessor(
+	db *sqlx.DB,
+	rmqClient *rabbitmq.Client,
+	circleRepo circle.Repository,
+	contribRepo contribution.Repository,
+	payoutRepo payout.Repository,
+	reputationRepo reputation.Repository,
+	userRepo user.Repository,
+) *EventProcessor {
+	return &EventProcessor{
+		db:             db,
+		rmqClient:      rmqClient,
+		circleRepo:     circleRepo,
+		contribRepo:    contribRepo,
+		payoutRepo:     payoutRepo,
+		reputationRepo: reputationRepo,
+		userRepo:       userRepo,
+	}
+}
+
+// SetWebSocketBroadcast sets the callback for real-time WebSocket updates.
+// When set, every processed event will be broadcast to connected clients
+// subscribed to the relevant circle room.
+func (p *EventProcessor) SetWebSocketBroadcast(fn func(circleID string, data any)) {
+	p.wsBroadcast = fn
+}
+
+// SetContractVersionResolver sets how the deployed version of an emitting
+// contract is determined when an event is recorded to the audit log.
+//
+// Passing nil disables version resolution, and every event is then recorded
+// with ContractVersionUnknown. Callers are expected to pass a caching
+// resolver: this is called once per event, and an uncached resolver would issue
+// a ledger read for every event.
+func (p *EventProcessor) SetContractVersionResolver(r ContractVersionResolver) {
+	p.versions = r
+}
+
+// SetKnownContracts sets the contract IDs whose events are dispatched to
+// handlers. Contract strkeys ("C...") are also registered in the hex form used
+// by decoded events. When empty, no event is treated as coming from an
+// unknown contract.
+func (p *EventProcessor) SetKnownContracts(ids []string) {
+	p.knownContracts = make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		p.knownContracts[id] = struct{}{}
+		if raw, err := strkey.Decode(strkey.VersionByteContract, id); err == nil {
+			p.knownContracts[fmt.Sprintf("%x", raw)] = struct{}{}
+		}
+	}
+}
+
+// SetEventCounters attaches the per-event-type counters. Every event that
+// reaches processContractEvents is counted by event type, so a new contract
+// event type becomes visible on /metrics on its first arrival with no change to
+// this package.
+func (p *EventProcessor) SetEventCounters(c *EventCounters) {
+	p.events = c
+}
+
+func (p *EventProcessor) isUnknownContract(contractID string) bool {
+	if len(p.knownContracts) == 0 {
+		return false
+	}
+	_, ok := p.knownContracts[contractID]
+	return !ok
+}
+
+// ProcessTransaction maps a Stellar transaction to domain events and
+// persists the resulting entities to PostgreSQL.
+func (p *EventProcessor) ProcessTransaction(ctx context.Context, txn *Transaction) error {
+	if len(txn.Operations) == 0 {
+		return nil
+	}
+
+	var errs []error
+	for _, op := range txn.Operations {
+		if err := p.processOperation(ctx, txn, &op); err != nil {
+			log.Warn().Err(err).
+				Str("hash", txn.Hash).
+				Str("op_type", op.Type).
+				Msg("processing operation")
+			errs = append(errs, err)
+			continue
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("processing %d/%d operations: %w", len(errs), len(txn.Operations), errs[0])
+	}
+	return nil
+}
+
+// txnTime returns the ledger close time for a transaction, falling back to
+// time.Now().UTC() when the close time was not populated (e.g. in tests).
+// This ensures all database timestamps follow ledger sequence ordering
+// rather than wall-clock time (#471).
+func txnTime(txn *Transaction) time.Time {
+	if !txn.LedgerCloseTime.IsZero() {
+		return txn.LedgerCloseTime.UTC()
+	}
+	return time.Now().UTC()
+}
+
+// evTime returns the ledger close time carried by a decoded contract event,
+// falling back to time.Now().UTC() when unset (e.g. in tests). Mirrors
+// txnTime for handlers that only receive the event (#471).
+func evTime(ev *ContractEvent) time.Time {
+	if ev != nil && !ev.LedgerCloseTime.IsZero() {
+		return ev.LedgerCloseTime.UTC()
+	}
+	return time.Now().UTC()
+}
+
+func (p *EventProcessor) processOperation(ctx context.Context, txn *Transaction, op *Operation) error {
+	switch {
+	case op.Type == "create_account":
+		return p.handleCreateAccount(ctx, txn, op)
+	case op.Type == "payment":
+		return p.handlePayment(ctx, txn, op)
+	case op.Type == "invoke_host_function":
+		return p.handleSorobanInvoke(ctx, txn, op)
+	case op.Type == "extend_footprint_ttl":
+		return p.handleExtendTTL(ctx, txn, op)
+	default:
+		log.Debug().Str("type", op.Type).Msg("unhandled operation type")
+		return nil
+	}
+}
+
+func (p *EventProcessor) handleCreateAccount(ctx context.Context, txn *Transaction, op *Operation) error {
+	// A new Stellar account was created — potentially a new user onboarding.
+	// In production this would trigger user auto-creation and KYC workflows.
+	log.Info().
+		Str("hash", txn.Hash).
+		Str("source", op.SourceAccount).
+		Msg("create_account detected")
+
+	p.Broadcast(ctx, op.SourceAccount, "account_created", map[string]any{
+		"hash":    txn.Hash,
+		"account": op.SourceAccount,
+		"ledger":  txn.Ledger,
+	}, txnTime(txn))
+	return nil
+}
+
+func (p *EventProcessor) handlePayment(ctx context.Context, txn *Transaction, op *Operation) error {
+	// A payment operation was detected — could represent a circle contribution,
+	// a payout distribution, or a Soroban contract interaction.
+	log.Info().
+		Str("hash", txn.Hash).
+		Str("source", op.SourceAccount).
+		Msg("payment detected")
+
+	p.Broadcast(ctx, op.SourceAccount, "payment_detected", map[string]any{
+		"hash":   txn.Hash,
+		"source": op.SourceAccount,
+		"ledger": txn.Ledger,
+	}, txnTime(txn))
+	return nil
+}
+
+// handleSorobanInvoke decodes the result_meta_xdr attached to an
+// invoke_host_function operation, extracts all Soroban contract events, and
+// dispatches each to the appropriate typed handler.
+func (p *EventProcessor) handleSorobanInvoke(ctx context.Context, txn *Transaction, op *Operation) error {
+	events, skipped, err := ParseContractEvents(txn.Hash, txn.Ledger, op.ResultMetaXDR)
+	if err != nil {
+		// Non-fatal: log and continue; the event is on-chain and will be
+		// retried by the reconciler on the next pass.
+		log.Warn().Err(err).
+			Str("hash", txn.Hash).
+			Int64("ledger", txn.Ledger).
+			Str("payload", payloadSnippet(op.ResultMetaXDR)).
+			Msg("parsing contract events from result_meta_xdr")
+		return nil
+	}
+	if skipped > 0 && p.events != nil {
+		// Undecodable events cannot be attributed to an event type, so they
+		// are counted by reason rather than folded into the per-type totals.
+		p.events.DecodeSkipped.WithLabelValues("malformed_event").Add(float64(skipped))
+	}
+
+	p.processContractEvents(ctx, txn.Hash, events, txnTime(txn))
+	return nil
+}
+
+// processContractEvents dispatches decoded events and records all of them in
+// the contract_events log. Events from unknown contracts are skipped, counted
+// and only recorded so they can be decoded later; a single bad event never
+// stops the rest of the transaction from being processed.
+//
+// This is the single choke point every decoded event passes through, which is
+// what keeps the per-event-type counters complete: every event is counted
+// exactly once here, whatever its type, so a type the indexer has never seen
+// still lands in the counters.
+func (p *EventProcessor) processContractEvents(ctx context.Context, txHash string, events []ContractEvent, closeTime time.Time) {
+	for i := range events {
+		events[i].LedgerCloseTime = closeTime
+	}
+	for _, ev := range events {
+		if p.isUnknownContract(ev.ContractID) {
+			if p.unknownEvents != nil {
+				p.unknownEvents.Inc()
+			}
+			p.events.Count(ev.EventType, OutcomeDLQ)
+			log.Warn().
+				Str("event_type", ev.EventType).
+				Str("contract", ev.ContractID).
+				Str("hash", txHash).
+				Msg("skipping event from unknown contract")
+			continue
+		}
+		if err := p.safeDispatchEvent(ctx, &ev); err != nil {
+			p.events.Count(ev.EventType, OutcomeFailed)
+			log.Warn().Err(err).
+				Str("event_type", ev.EventType).
+				Str("contract", ev.ContractID).
+				Str("hash", txHash).
+				Msg("dispatching contract event")
+			continue
+		}
+		p.events.Count(ev.EventType, OutcomeDecoded)
+	}
+
+	// Persist every event to the contract_events audit table regardless of
+	// individual dispatch success (idempotent append-only log).
+	if p.db == nil {
+		return
+	}
+	for _, ev := range events {
+		if err := p.persistContractEvent(ctx, &ev); err != nil {
+			log.Warn().Err(err).
+				Str("event_type", ev.EventType).
+				Msg("persisting contract event to audit log")
+		}
+	}
+}
+
+// safeDispatchEvent runs dispatchEvent and converts a handler panic caused by
+// a malformed (poison) event into an error.
+func (p *EventProcessor) safeDispatchEvent(ctx context.Context, ev *ContractEvent) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic dispatching %s: %v", ev.EventType, r)
+		}
+	}()
+	return p.dispatchEvent(ctx, ev)
+}
+
+func (p *EventProcessor) handleExtendTTL(ctx context.Context, txn *Transaction, op *Operation) error {
+	// Contract instance storage TTL was extended — no domain event required,
+	// but we track it for observability.
+	log.Debug().
+		Str("hash", txn.Hash).
+		Str("source", op.SourceAccount).
+		Msg("extend_footprint_ttl detected")
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// dispatchEvent routes a decoded ContractEvent to its typed handler.
+// ---------------------------------------------------------------------------
+
+func (p *EventProcessor) dispatchEvent(ctx context.Context, ev *ContractEvent) error {
+	switch ev.EventType {
+	case EventCircleCreated:
+		return p.onCircleCreated(ctx, ev)
+	case EventMemberJoined:
+		return p.onMemberJoined(ctx, ev)
+	case EventContributionReceived:
+		return p.onContributionReceived(ctx, ev)
+	case EventPayoutExecuted:
+		return p.onPayoutExecuted(ctx, ev)
+	case EventLateReported:
+		return p.onLateReported(ctx, ev)
+	case EventMemberExited:
+		return p.onMemberExited(ctx, ev)
+	case EventDefaultRecorded:
+		return p.onDefaultRecorded(ctx, ev)
+	case EventCircleCompleted:
+		return p.onCircleCompleted(ctx, ev)
+	case EventAuctionBid:
+		return p.onAuctionBid(ctx, ev)
+	case EventVoteCast:
+		return p.onVoteCast(ctx, ev)
+	case EventDisputeRaised:
+		return p.onDisputeRaised(ctx, ev)
+	case EventFeeDeposited:
+		return p.onFeeDeposited(ctx, ev)
+	default:
+		log.Debug().Str("event_type", ev.EventType).Msg("unknown contract event — skipping")
+		return nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Individual event handlers
+// ---------------------------------------------------------------------------
+
+// onCircleCreated handles CircleCreated(circle_id, creator, config_hash).
+// The circle must already exist in the DB (created via the API); this handler
+// links it to its on-chain contract ID.
+func (p *EventProcessor) onCircleCreated(ctx context.Context, ev *ContractEvent) error {
+	contractID := payloadStr(ev.Payload, "circle_id")
+	if contractID == "" {
+		contractID = ev.ContractID
+	}
+
+	existing, err := p.circleRepo.FindByContractID(ctx, contractID)
+	if err != nil && !isNotFound(err) {
+		return fmt.Errorf("onCircleCreated find: %w", err)
+	}
+	if existing != nil {
+		// Already linked — idempotent.
+		log.Debug().Str("contract_id", contractID).Msg("CircleCreated: circle already linked")
+	} else {
+		log.Info().
+			Str("contract_id", contractID).
+			Str("creator", payloadStr(ev.Payload, "creator")).
+			Msg("CircleCreated: new on-chain circle (not yet matched to DB record)")
+	}
+
+	p.Broadcast(ctx, contractID, "circle.created", map[string]any{
+		"contract_id": contractID,
+		"creator":     payloadStr(ev.Payload, "creator"),
+		"tx_hash":     ev.TxHash,
+		"ledger":      ev.Ledger,
+	}, evTime(ev))
+	return nil
+}
+
+// onMemberJoined handles MemberJoined(circle_id, member, contribution_amount).
+// Resolves the wallet address to an internal user ID and creates a CircleMember row.
+func (p *EventProcessor) onMemberJoined(ctx context.Context, ev *ContractEvent) error {
+	contractID := payloadStr(ev.Payload, "circle_id")
+	walletAddr := payloadStr(ev.Payload, "member")
+
+	c, err := p.circleRepo.FindByContractID(ctx, contractID)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("contract_id", contractID).Msg("MemberJoined: circle not found in DB")
+			return nil
+		}
+		return fmt.Errorf("onMemberJoined find circle: %w", err)
+	}
+
+	u, err := p.userRepo.FindByWalletAddress(ctx, walletAddr)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("wallet", walletAddr).Msg("MemberJoined: user not found in DB")
+			return nil
+		}
+		return fmt.Errorf("onMemberJoined find user: %w", err)
+	}
+
+	member := &circle.CircleMember{
+		CircleID: c.ID,
+		UserID:   u.ID,
+		Status:   circle.MemberStatusActive,
+		JoinedAt: evTime(ev),
+	}
+	if err := p.circleRepo.CreateMember(ctx, member); err != nil {
+		if errors.Is(err, circle.ErrAlreadyMember) {
+			log.Debug().Str("tx_hash", ev.TxHash).Msg("MemberJoined: already recorded")
+			return nil
+		}
+		return fmt.Errorf("onMemberJoined create member: %w", err)
+	}
+
+	log.Info().
+		Str("circle_id", c.ID.String()).
+		Str("user_id", u.ID.String()).
+		Msg("MemberJoined: member record created")
+
+	p.Broadcast(ctx, c.ID.String(), "member.joined", map[string]any{
+		"circle_id": c.ID.String(),
+		"user_id":   u.ID.String(),
+		"wallet":    walletAddr,
+		"tx_hash":   ev.TxHash,
+	}, evTime(ev))
+	return nil
+}
+
+// onContributionReceived handles ContributionReceived(circle_id, member, amount, round).
+// Inserts a confirmed Contribution row linked to the on-chain transaction.
+func (p *EventProcessor) onContributionReceived(ctx context.Context, ev *ContractEvent) error {
+	contractID := payloadStr(ev.Payload, "circle_id")
+	walletAddr := payloadStr(ev.Payload, "member")
+	amount := payloadFloat(ev.Payload, "amount")
+	round := payloadInt(ev.Payload, "round")
+
+	c, err := p.circleRepo.FindByContractID(ctx, contractID)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("contract_id", contractID).Msg("ContributionReceived: circle not found")
+			return nil
+		}
+		return fmt.Errorf("onContributionReceived find circle: %w", err)
+	}
+
+	u, err := p.userRepo.FindByWalletAddress(ctx, walletAddr)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("wallet", walletAddr).Msg("ContributionReceived: user not found")
+			return nil
+		}
+		return fmt.Errorf("onContributionReceived find user: %w", err)
+	}
+
+	contrib := &contribution.Contribution{
+		ID:          uuid.New(),
+		CircleID:    c.ID,
+		UserID:      u.ID,
+		RoundNumber: round,
+		Amount:      amount,
+		TxnHash:     sql.NullString{String: ev.TxHash, Valid: true},
+		Status:      contribution.StatusConfirmed,
+		OnTime:      true,
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+	}
+	// The contribution and the circle's round/total counters are written in one
+	// transaction under a per-circle advisory lock, so a crash can never leave
+	// a contribution recorded against stale circle state, and concurrent
+	// contributions to the same circle cannot lose one another's amount.
+	advance, err := p.applyContribution(ctx, contrib)
+	if err != nil {
+		if errors.Is(err, apperrors.ErrConflict) {
+			// Already recorded by an earlier pass over this ledger range;
+			// skip the counter update so totals are not counted twice.
+			log.Debug().Str("tx_hash", ev.TxHash).Msg("ContributionReceived: already recorded")
+			return nil
+		}
+		return fmt.Errorf("onContributionReceived record contribution: %w", err)
+	}
+
+	log.Info().
+		Str("circle_id", c.ID.String()).
+		Str("user_id", u.ID.String()).
+		Float64("amount", amount).
+		Int("round", round).
+		Bool("round_advanced", advance.Advanced).
+		Msg("ContributionReceived: contribution persisted")
+
+	p.Broadcast(ctx, c.ID.String(), "contribution.confirmed", map[string]any{
+		"circle_id":       c.ID.String(),
+		"user_id":         u.ID.String(),
+		"amount":          amount,
+		"round":           round,
+		"contribution_id": contrib.ID.String(),
+		"tx_hash":         ev.TxHash,
+	}, evTime(ev))
+	return nil
+}
+
+// onPayoutExecuted handles PayoutExecuted(circle_id, recipient, amount, round, payout_type).
+// Inserts a Payout row and advances the circle's CurrentRound counter.
+func (p *EventProcessor) onPayoutExecuted(ctx context.Context, ev *ContractEvent) error {
+	contractID := payloadStr(ev.Payload, "circle_id")
+	recipientWallet := payloadStr(ev.Payload, "recipient")
+	amount := payloadFloat(ev.Payload, "amount")
+	round := payloadInt(ev.Payload, "round")
+	payoutTypeStr := payloadStr(ev.Payload, "payout_type")
+
+	c, err := p.circleRepo.FindByContractID(ctx, contractID)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("contract_id", contractID).Msg("PayoutExecuted: circle not found")
+			return nil
+		}
+		return fmt.Errorf("onPayoutExecuted find circle: %w", err)
+	}
+
+	recipient, err := p.userRepo.FindByWalletAddress(ctx, recipientWallet)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("wallet", recipientWallet).Msg("PayoutExecuted: recipient not found")
+			return nil
+		}
+		return fmt.Errorf("onPayoutExecuted find recipient: %w", err)
+	}
+
+	pt := payout.PayoutTypeRandom
+	switch payoutTypeStr {
+	case "fixed":
+		pt = payout.PayoutTypeFixed
+	case "auction":
+		pt = payout.PayoutTypeAuction
+	case "vote":
+		pt = payout.PayoutTypeVote
+	}
+
+	p2 := &payout.Payout{
+		ID:          uuid.New(),
+		CircleID:    c.ID,
+		RecipientID: recipient.ID,
+		RoundNumber: round,
+		Amount:      amount,
+		TxnHash:     sql.NullString{String: ev.TxHash, Valid: true},
+		PayoutType:  pt,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := p.recordPayoutAndAdvance(ctx, p2); err != nil {
+		if errors.Is(err, apperrors.ErrConflict) {
+			log.Debug().Str("tx_hash", ev.TxHash).Msg("PayoutExecuted: already recorded")
+			return nil
+		}
+		return fmt.Errorf("onPayoutExecuted record payout: %w", err)
+	}
+
+	log.Info().
+		Str("circle_id", c.ID.String()).
+		Str("recipient_id", recipient.ID.String()).
+		Float64("amount", amount).
+		Int("round", round).
+		Msg("PayoutExecuted: payout persisted")
+
+	p.Broadcast(ctx, c.ID.String(), "payout.received", map[string]any{
+		"circle_id":    c.ID.String(),
+		"recipient_id": recipient.ID.String(),
+		"amount":       amount,
+		"round":        round,
+		"payout_id":    p2.ID.String(),
+		"tx_hash":      ev.TxHash,
+	}, evTime(ev))
+	return nil
+}
+
+// onLateReported handles LateReported(circle_id, member, penalty_amount, strikes).
+// Updates the contribution status to late and marks it not on-time.
+func (p *EventProcessor) onLateReported(ctx context.Context, ev *ContractEvent) error {
+	contractID := payloadStr(ev.Payload, "circle_id")
+	walletAddr := payloadStr(ev.Payload, "member")
+	penaltyAmount := payloadFloat(ev.Payload, "penalty_amount")
+	strikes := payloadInt(ev.Payload, "strikes")
+
+	c, err := p.circleRepo.FindByContractID(ctx, contractID)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("contract_id", contractID).Msg("LateReported: circle not found")
+			return nil
+		}
+		return fmt.Errorf("onLateReported find circle: %w", err)
+	}
+
+	u, err := p.userRepo.FindByWalletAddress(ctx, walletAddr)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("wallet", walletAddr).Msg("LateReported: user not found")
+			return nil
+		}
+		return fmt.Errorf("onLateReported find user: %w", err)
+	}
+
+	log.Warn().
+		Str("circle_id", c.ID.String()).
+		Str("user_id", u.ID.String()).
+		Float64("penalty", penaltyAmount).
+		Int("strikes", strikes).
+		Msg("LateReported: late payment recorded")
+
+	p.Broadcast(ctx, c.ID.String(), "contribution.late", map[string]any{
+		"circle_id":      c.ID.String(),
+		"user_id":        u.ID.String(),
+		"penalty_amount": penaltyAmount,
+		"strikes":        strikes,
+		"tx_hash":        ev.TxHash,
+	}, evTime(ev))
+	return nil
+}
+
+// onMemberExited handles MemberExited(circle_id, member, penalty).
+// Updates the circle member status to exited.
+func (p *EventProcessor) onMemberExited(ctx context.Context, ev *ContractEvent) error {
+	contractID := payloadStr(ev.Payload, "circle_id")
+	walletAddr := payloadStr(ev.Payload, "member")
+	penalty := payloadFloat(ev.Payload, "penalty")
+
+	c, err := p.circleRepo.FindByContractID(ctx, contractID)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("contract_id", contractID).Msg("MemberExited: circle not found")
+			return nil
+		}
+		return fmt.Errorf("onMemberExited find circle: %w", err)
+	}
+
+	u, err := p.userRepo.FindByWalletAddress(ctx, walletAddr)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("wallet", walletAddr).Msg("MemberExited: user not found")
+			return nil
+		}
+		return fmt.Errorf("onMemberExited find user: %w", err)
+	}
+
+	if err := p.circleRepo.UpdateMemberStatus(ctx, c.ID, u.ID, circle.MemberStatusExited); err != nil {
+		return fmt.Errorf("onMemberExited update status: %w", err)
+	}
+
+	log.Info().
+		Str("circle_id", c.ID.String()).
+		Str("user_id", u.ID.String()).
+		Float64("penalty", penalty).
+		Msg("MemberExited: member status updated to exited")
+
+	p.Broadcast(ctx, c.ID.String(), "member.exited", map[string]any{
+		"circle_id": c.ID.String(),
+		"user_id":   u.ID.String(),
+		"penalty":   penalty,
+		"tx_hash":   ev.TxHash,
+	}, evTime(ev))
+	return nil
+}
+
+// onDefaultRecorded handles DefaultRecorded(circle_id, member).
+// Triggers an on-chain default reputation penalty via reputation score update.
+func (p *EventProcessor) onDefaultRecorded(ctx context.Context, ev *ContractEvent) error {
+	walletAddr := payloadStr(ev.Payload, "member")
+	contractID := payloadStr(ev.Payload, "circle_id")
+
+	u, err := p.userRepo.FindByWalletAddress(ctx, walletAddr)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("wallet", walletAddr).Msg("DefaultRecorded: user not found")
+			return nil
+		}
+		return fmt.Errorf("onDefaultRecorded find user: %w", err)
+	}
+
+	// Retrieve current reputation snapshot and recalculate with a penalty.
+	existing, err := p.reputationRepo.GetByUser(ctx, u.ID)
+	if err != nil && !isNotFound(err) {
+		return fmt.Errorf("onDefaultRecorded get reputation: %w", err)
+	}
+
+	currentScore := 0
+	if existing != nil {
+		currentScore = existing.Score
+	}
+
+	// Apply default penalty (−50 points, floored at 0).
+	newScore := currentScore - 50
+	if newScore < 0 {
+		newScore = 0
+	}
+	level := reputationLevel(newScore)
+
+	snapshot := &reputation.ReputationSnapshot{
+		UserID:    u.ID,
+		Score:     newScore,
+		Level:     level,
+		Month:     time.Now().UTC(),
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := p.reputationRepo.SaveSnapshot(ctx, snapshot); err != nil {
+		return fmt.Errorf("onDefaultRecorded save snapshot: %w", err)
+	}
+
+	if err := p.userRepo.UpdateMoiScore(ctx, u.ID, newScore); err != nil {
+		log.Warn().Err(err).Msg("DefaultRecorded: updating user moi_score")
+	}
+
+	log.Warn().
+		Str("user_id", u.ID.String()).
+		Str("contract_id", contractID).
+		Int("new_score", newScore).
+		Msg("DefaultRecorded: reputation penalty applied")
+
+	p.Broadcast(ctx, contractID, "reputation.updated", map[string]any{
+		"user_id":   u.ID.String(),
+		"new_score": newScore,
+		"level":     level,
+		"reason":    "default",
+		"tx_hash":   ev.TxHash,
+	}, evTime(ev))
+	return nil
+}
+
+// onCircleCompleted handles CircleCompleted(circle_id, total_contributions).
+// Marks the circle as completed and sets the end date.
+func (p *EventProcessor) onCircleCompleted(ctx context.Context, ev *ContractEvent) error {
+	contractID := payloadStr(ev.Payload, "circle_id")
+	totalContribs := payloadFloat(ev.Payload, "total_contributions")
+
+	c, err := p.circleRepo.FindByContractID(ctx, contractID)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("contract_id", contractID).Msg("CircleCompleted: circle not found")
+			return nil
+		}
+		return fmt.Errorf("onCircleCompleted find circle: %w", err)
+	}
+
+	now := time.Now().UTC()
+	c.Status = circle.CircleStatusCompleted
+	c.TotalContributions = totalContribs
+	c.EndDate = sql.NullTime{Time: now, Valid: true}
+	if err := p.circleRepo.Update(ctx, c); err != nil {
+		return fmt.Errorf("onCircleCompleted update: %w", err)
+	}
+
+	log.Info().
+		Str("circle_id", c.ID.String()).
+		Float64("total_contributions", totalContribs).
+		Msg("CircleCompleted: circle marked completed")
+
+	p.Broadcast(ctx, c.ID.String(), "circle.completed", map[string]any{
+		"circle_id":           c.ID.String(),
+		"total_contributions": totalContribs,
+		"tx_hash":             ev.TxHash,
+	}, evTime(ev))
+	return nil
+}
+
+// onAuctionBid handles AuctionBid(circle_id, bidder, discount_bips, round).
+// Persists the bid to circle_auction_bids table and broadcasts the event.
+func (p *EventProcessor) onAuctionBid(ctx context.Context, ev *ContractEvent) error {
+	contractID := payloadStr(ev.Payload, "circle_id")
+	if contractID == "" {
+		contractID = ev.ContractID
+	}
+	bidder := payloadStr(ev.Payload, "bidder")
+	discountBips := payloadInt(ev.Payload, "discount_bips")
+	round := payloadInt(ev.Payload, "round")
+
+	if p.circleRepo == nil || p.userRepo == nil {
+		p.Broadcast(ctx, contractID, "auction.bid", map[string]any{
+			"contract_id":   contractID,
+			"bidder":        bidder,
+			"discount_bips": discountBips,
+			"round":         round,
+			"tx_hash":       ev.TxHash,
+		}, evTime(ev))
+		return nil
+	}
+
+	c, err := p.circleRepo.FindByContractID(ctx, contractID)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("contract_id", contractID).Msg("AuctionBid: circle not found")
+			return nil
+		}
+		return fmt.Errorf("onAuctionBid find circle: %w", err)
+	}
+
+	u, err := p.userRepo.FindByWalletAddress(ctx, bidder)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("wallet", bidder).Msg("AuctionBid: user not found")
+			return nil
+		}
+		return fmt.Errorf("onAuctionBid find user: %w", err)
+	}
+
+	bid := &circle.CircleAuctionBid{
+		ID:          uuid.New(),
+		CircleID:    c.ID,
+		BidderID:    u.ID,
+		RoundNumber: round,
+		BidAmount:   float64(discountBips),
+		CreatedAt:   time.Now().UTC(),
+	}
+
+	if err := p.circleRepo.CreateAuctionBid(ctx, bid); err != nil {
+		return fmt.Errorf("onAuctionBid create auction bid: %w", err)
+	}
+
+	log.Info().
+		Str("circle_id", c.ID.String()).
+		Str("bidder_id", u.ID.String()).
+		Int("discount_bips", discountBips).
+		Int("round", round).
+		Msg("AuctionBid: bid persisted")
+
+	p.Broadcast(ctx, c.ID.String(), "auction.bid", map[string]any{
+		"circle_id":     c.ID.String(),
+		"bidder_id":     u.ID.String(),
+		"contract_id":   contractID,
+		"bidder":        bidder,
+		"discount_bips": discountBips,
+		"round":         round,
+		"tx_hash":       ev.TxHash,
+	}, evTime(ev))
+	return nil
+}
+
+// onVoteCast handles VoteCast(circle_id, voter, vote_for, round).
+// Persists the vote to circle_votes table, idempotent on (circle_id, voter_id, round_number).
+func (p *EventProcessor) onVoteCast(ctx context.Context, ev *ContractEvent) error {
+	contractID := payloadStr(ev.Payload, "circle_id")
+	if contractID == "" {
+		contractID = ev.ContractID
+	}
+	voter := payloadStr(ev.Payload, "voter")
+	voteFor := payloadStr(ev.Payload, "vote_for")
+	round := payloadInt(ev.Payload, "round")
+
+	if p.circleRepo == nil || p.userRepo == nil {
+		log.Info().
+			Str("contract_id", contractID).
+			Str("voter", voter).
+			Str("vote_for", voteFor).
+			Int("round", round).
+			Msg("VoteCast: vote recorded")
+
+		p.Broadcast(ctx, contractID, "vote.cast", map[string]any{
+			"contract_id": contractID,
+			"voter":       voter,
+			"vote_for":    voteFor,
+			"round":       round,
+			"tx_hash":     ev.TxHash,
+		}, evTime(ev))
+		return nil
+	}
+
+	c, err := p.circleRepo.FindByContractID(ctx, contractID)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("contract_id", contractID).Msg("VoteCast: circle not found")
+			return nil
+		}
+		return fmt.Errorf("onVoteCast find circle: %w", err)
+	}
+
+	voterUser, err := p.userRepo.FindByWalletAddress(ctx, voter)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("wallet", voter).Msg("VoteCast: voter not found")
+			return nil
+		}
+		return fmt.Errorf("onVoteCast find voter: %w", err)
+	}
+
+	recipientUser, err := p.userRepo.FindByWalletAddress(ctx, voteFor)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("wallet", voteFor).Msg("VoteCast: recipient not found")
+			return nil
+		}
+		return fmt.Errorf("onVoteCast find recipient: %w", err)
+	}
+
+	vote := &circle.CircleVote{
+		ID:          uuid.New(),
+		CircleID:    c.ID,
+		VoterID:     voterUser.ID,
+		RecipientID: recipientUser.ID,
+		RoundNumber: round,
+		CreatedAt:   time.Now().UTC(),
+	}
+
+	if err := p.circleRepo.CreateVote(ctx, vote); err != nil {
+		if errors.Is(err, apperrors.ErrConflict) {
+			log.Debug().Str("tx_hash", ev.TxHash).Msg("VoteCast: already recorded")
+			return nil
+		}
+		return fmt.Errorf("onVoteCast create vote: %w", err)
+	}
+
+	log.Info().
+		Str("circle_id", c.ID.String()).
+		Str("voter_id", voterUser.ID.String()).
+		Str("recipient_id", recipientUser.ID.String()).
+		Int("round", round).
+		Msg("VoteCast: vote persisted")
+
+	p.Broadcast(ctx, c.ID.String(), "vote.cast", map[string]any{
+		"circle_id":    c.ID.String(),
+		"contract_id":  contractID,
+		"voter_id":     voterUser.ID.String(),
+		"recipient_id": recipientUser.ID.String(),
+		"round":        round,
+		"tx_hash":      ev.TxHash,
+	}, evTime(ev))
+	return nil
+}
+
+// onDisputeRaised handles DisputeRaised(circle_id, member, evidence_hash).
+// Transitions the circle to "disputed" status, freezing payouts until resolved,
+// and persists the dispute to the circle_disputes table (#475).
+func (p *EventProcessor) onDisputeRaised(ctx context.Context, ev *ContractEvent) error {
+	contractID := payloadStr(ev.Payload, "circle_id")
+	member := payloadStr(ev.Payload, "member")
+	evidenceHash := payloadStr(ev.Payload, "evidence_hash")
+
+	c, err := p.circleRepo.FindByContractID(ctx, contractID)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("contract_id", contractID).Msg("DisputeRaised: circle not found")
+			return nil
+		}
+		return fmt.Errorf("onDisputeRaised find circle: %w", err)
+	}
+
+	// Set circle status to disputed to freeze further payouts.
+	c.Status = "disputed"
+	if err := p.circleRepo.Update(ctx, c); err != nil {
+		return fmt.Errorf("onDisputeRaised update circle status: %w", err)
+	}
+
+	// #475 — Persist the dispute to circle_disputes so the API can query it.
+	// Resolve the raiser's internal user ID from their wallet address.
+	raiserUUID := ""
+	if member != "" && p.userRepo != nil {
+		u, err := p.userRepo.FindByWalletAddress(ctx, member)
+		if err == nil && u != nil {
+			raiserUUID = u.ID.String()
+		} else {
+			log.Warn().Str("wallet", member).Msg("DisputeRaised: raiser user not found, using wallet as identifier")
+		}
+	}
+
+	if p.db != nil && raiserUUID != "" {
+		_, err := p.db.ExecContext(ctx, `
+			INSERT INTO circle_disputes (circle_id, raiser_id, reason, details, status, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, 'open', $5, $5)
+			ON CONFLICT (circle_id, raiser_id, created_at) DO NOTHING`,
+			c.ID.String(), raiserUUID, "Dispute raised via on-chain event",
+			fmt.Sprintf("evidence_hash: %s, tx_hash: %s", evidenceHash, ev.TxHash),
+			time.Now().UTC(),
+		)
+		if err != nil {
+			log.Warn().Err(err).Msg("DisputeRaised: failed to persist dispute record")
+		}
+	}
+
+	log.Warn().
+		Str("circle_id", c.ID.String()).
+		Str("member_wallet", member).
+		Str("evidence_hash", evidenceHash).
+		Msg("DisputeRaised: circle frozen")
+
+	p.Broadcast(ctx, c.ID.String(), "dispute.raised", map[string]any{
+		"circle_id":     c.ID.String(),
+		"member_wallet": member,
+		"evidence_hash": evidenceHash,
+		"tx_hash":       ev.TxHash,
+	}, evTime(ev))
+	return nil
+}
+
+// onFeeDeposited handles FeeDeposited events from the Treasury contract.
+// Persists the fee to treasury_fees table, idempotent on (tx_hash, circle_id).
+func (p *EventProcessor) onFeeDeposited(ctx context.Context, ev *ContractEvent) error {
+	circleID := payloadStr(ev.Payload, "circle_id")
+	amount := payloadFloat(ev.Payload, "amount")
+
+	if p.db != nil {
+		_, err := p.db.ExecContext(ctx, `
+			INSERT INTO treasury_fees (circle_id, amount, tx_hash, ledger, created_at)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (tx_hash, circle_id) DO NOTHING`,
+			circleID, amount, ev.TxHash, ev.Ledger, ev.LedgerCloseTime,
+		)
+		if err != nil {
+			log.Warn().Err(err).
+				Str("circle_id", circleID).
+				Float64("amount", amount).
+				Str("tx_hash", ev.TxHash).
+				Msg("onFeeDeposited: persisting treasury fee")
+		} else {
+			log.Info().
+				Str("circle_id", circleID).
+				Float64("amount", amount).
+				Str("tx_hash", ev.TxHash).
+				Msg("FeeDeposited: protocol fee collected and persisted")
+		}
+	} else {
+		log.Info().
+			Str("circle_id", circleID).
+			Float64("amount", amount).
+			Str("tx_hash", ev.TxHash).
+			Msg("FeeDeposited: protocol fee collected")
+	}
+
+	p.Broadcast(ctx, circleID, "fee.deposited", map[string]any{
+		"circle_id": circleID,
+		"amount":    amount,
+		"tx_hash":   ev.TxHash,
+		"ledger":    ev.Ledger,
+	}, evTime(ev))
+	return nil
+}
+
+// GetTreasuryFeesSummary returns the total fee amount and count of fees deposited.
+func (p *EventProcessor) GetTreasuryFeesSummary(ctx context.Context, circleID string) (float64, int, error) {
+	if p.db == nil {
+		return 0, 0, nil
+	}
+	var total sql.NullFloat64
+	var count int
+	var err error
+	if circleID != "" {
+		err = p.db.QueryRowContext(ctx, `
+			SELECT COALESCE(SUM(amount), 0), COUNT(*)
+			FROM treasury_fees
+			WHERE circle_id = $1`, circleID).Scan(&total, &count)
+	} else {
+		err = p.db.QueryRowContext(ctx, `
+			SELECT COALESCE(SUM(amount), 0), COUNT(*)
+			FROM treasury_fees`).Scan(&total, &count)
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	return total.Float64, count, nil
+}
+
+// eventRecorded reports whether the event is already in the audit log, which
+// means an earlier pass fully applied it. Lookup failures are treated as
+// "not recorded": the unique constraints on the domain tables still keep a
+// replay harmless.
+func (p *EventProcessor) eventRecorded(ctx context.Context, ev *ContractEvent) bool {
+	if p.db == nil {
+		return false
+	}
+	var exists bool
+	err := p.db.GetContext(ctx, &exists, `
+		SELECT EXISTS (
+			SELECT 1 FROM contract_events
+			WHERE tx_hash = $1 AND contract_id = $2 AND event_type = $3
+		)`, ev.TxHash, ev.ContractID, ev.EventType)
+	if err != nil {
+		log.Warn().Err(err).Str("event_type", ev.EventType).Msg("checking contract event log")
+		return false
+	}
+	return exists
+}
+
+// ---------------------------------------------------------------------------
+// persistContractEvent appends a processed event to the audit log.
+// ---------------------------------------------------------------------------
+
+func (p *EventProcessor) persistContractEvent(ctx context.Context, ev *ContractEvent) error {
+	payloadJSON, err := json.Marshal(ev.Payload)
+	if err != nil {
+		return fmt.Errorf("marshaling event payload: %w", err)
+	}
+
+	version := p.contractVersion(ctx, ev.ContractID)
+
+	_, err = p.db.ExecContext(ctx, `
+		INSERT INTO contract_events (tx_hash, ledger, contract_id, event_type, contract_version, payload, processed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT DO NOTHING`,
+		ev.TxHash, ev.Ledger, ev.ContractID, ev.EventType, version, payloadJSON, ev.LedgerCloseTime,
+	)
+	return err
+}
+
+// contractVersion reports the deployed version to record for an event emitted by
+// contractID.
+//
+// Resolution is best-effort and never fails the write: an event that cannot be
+// attributed to a contract version is still worth recording, because losing the
+// audit row loses more than the version does. Failures are counted and logged so
+// a persistently unresolved version is visible, and the row is written as
+// ContractVersionUnknown rather than being dropped or left blank.
+func (p *EventProcessor) contractVersion(ctx context.Context, contractID string) string {
+	if p.versions == nil {
+		return ContractVersionUnknown
+	}
+
+	version, err := p.versions.ResolveContractVersion(ctx, contractID)
+	if err != nil || version == "" {
+		if p.versionUnknown != nil {
+			p.versionUnknown.Inc()
+		}
+		log.Warn().Err(err).
+			Str("contract", contractID).
+			Msg("resolving contract version; recording event as unknown version")
+		return ContractVersionUnknown
+	}
+	return version
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast sends a real-time update via WebSocket and publishes the event
+// to RabbitMQ for async workers (notifications, webhooks, analytics).
+// ---------------------------------------------------------------------------
+
+func (p *EventProcessor) Broadcast(ctx context.Context, circleID string, eventType string, payload any, ts time.Time) {
+	// Real-time WebSocket broadcast to subscribed clients
+	if p.wsBroadcast != nil {
+		p.wsBroadcast(circleID, payload)
+	}
+
+	// Async event publishing to RabbitMQ
+	data, err := json.Marshal(map[string]any{
+		"type":      eventType,
+		"circleId":  circleID,
+		"payload":   payload,
+		"timestamp": ts,
+	})
+	if err != nil {
+		log.Warn().Err(err).Msg("marshaling event for rabbitmq")
+		return
+	}
+
+	if p.rmqClient != nil {
+		if err := p.rmqClient.Publish("moistello.events", "circle."+eventType, data); err != nil {
+			log.Warn().Err(err).Msg("publishing to rabbitmq")
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Payload extraction helpers — safe, nil-tolerant accessors.
+// ---------------------------------------------------------------------------
+
+func payloadStr(p map[string]any, key string) string {
+	if p == nil {
+		return ""
+	}
+	v, ok := p[key]
+	if !ok {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+func payloadFloat(p map[string]any, key string) float64 {
+	if p == nil {
+		return 0
+	}
+	v, ok := p[key]
+	if !ok {
+		return 0
+	}
+	switch f := v.(type) {
+	case float64:
+		return f
+	case float32:
+		return float64(f)
+	case int:
+		return float64(f)
+	case int64:
+		return float64(f)
+	case uint64:
+		return float64(f)
+	}
+	return 0
+}
+
+func payloadInt(p map[string]any, key string) int {
+	if p == nil {
+		return 0
+	}
+	v, ok := p[key]
+	if !ok {
+		return 0
+	}
+	switch i := v.(type) {
+	case int:
+		return i
+	case int32:
+		return int(i)
+	case int64:
+		return int(i)
+	case uint32:
+		return int(i)
+	case float64:
+		return int(i)
+	}
+	return 0
+}
+
+// isNotFound returns true for "not found" sentinel errors used by repositories.
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	return err.Error() == "not found" || err == sql.ErrNoRows
+}
+
+// reputationLevel maps a MoiScore to the human-readable tier string.
+func reputationLevel(score int) string {
+	switch {
+	case score > 800:
+		return "Diamond"
+	case score > 600:
+		return "Platinum"
+	case score > 400:
+		return "Gold"
+	case score > 200:
+		return "Silver"
+	default:
+		return "Bronze"
+	}
+}

@@ -1,0 +1,385 @@
+package user
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/deodes/backend/internal/domain/circle"
+	"github.com/deodes/backend/pkg/apperrors"
+)
+
+type Service interface {
+	GetByID(ctx context.Context, id string) (*User, error)
+	GetByWallet(ctx context.Context, wallet string) (*User, error)
+	GetByEmail(ctx context.Context, email string) (*User, error)
+	Create(ctx context.Context, wallet string) (*User, error)
+	Delete(ctx context.Context, id string) error
+	UpdateProfile(ctx context.Context, id string, updates UpdateProfileInput) (*User, error)
+	UpdateNotificationPreferences(ctx context.Context, id string, prefs NotificationPrefsInput) (*User, error)
+	IsEmailTaken(ctx context.Context, email string) (bool, error)
+	GetMoiScore(ctx context.Context, id string) (*MoiScoreResponse, error)
+	GetCircles(ctx context.Context, id string) ([]any, error)
+	ClaimName(ctx context.Context) (string, error)
+	Update(ctx context.Context, u *User) error
+}
+
+type UpdateProfileInput struct {
+	DisplayName       *string `json:"displayName"`
+	Email             *string `json:"email"`
+	Phone             *string `json:"phone"`
+	CountryCode       *string `json:"countryCode"`
+	PreferredLanguage *string `json:"preferredLanguage"`
+	SessionTTL        *int    `json:"sessionTtlMinutes"`
+}
+
+// NotificationPrefsInput carries the user's desired notification channel
+// preferences and mute flag for the UpdateNotificationPreferences endpoint.
+type NotificationPrefsInput struct {
+	// Channels is the ordered list of channels the user wants to receive
+	// notifications on (e.g. ["inapp", "email"]).  At least one channel must
+	// be provided.
+	Channels []string `json:"channels" binding:"required,min=1"`
+	// Muted, when true, suppresses all notifications for this user.
+	Muted bool `json:"muted"`
+	// DigestEnabled turns digest batching on/off for this user (#415). Left
+	// nil it is unchanged, so an existing client that only sends channels and
+	// muted keeps its current digest setting.
+	DigestEnabled *bool `json:"digestEnabled"`
+	// DigestIntervalMinutes is the desired digest cadence. Left nil it is
+	// unchanged. Must fall within the supported window; see
+	// NotificationDigestCadenceBounds.
+	DigestIntervalMinutes *int `json:"digestIntervalMinutes"`
+}
+
+// Digest cadence bounds, mirrored here rather than imported from the
+// notification package: the user domain must not depend on notification, which
+// already depends on the user domain through its adapters.
+const (
+	MinDigestIntervalMinutes     = 15
+	MaxDigestIntervalMinutes     = 7 * 24 * 60
+	DefaultDigestIntervalMinutes = 24 * 60
+)
+
+// NotificationDigestCadenceBounds returns the supported digest cadence window in
+// minutes, exposed so the preferences endpoint can report the valid range
+// rather than hard-coding it in validation alone.
+func NotificationDigestCadenceBounds() (min, max int) {
+	return MinDigestIntervalMinutes, MaxDigestIntervalMinutes
+}
+
+type MoiScoreResponse struct {
+	Score     int            `json:"score"`
+	Level     string         `json:"level"`
+	Breakdown MoiBreakdown   `json:"breakdown"`
+	History   []MonthlyScore `json:"history"`
+}
+
+type MoiBreakdown struct {
+	Streaks     int `json:"streaks"`
+	Completions int `json:"completions"`
+	Volume      int `json:"volume"`
+	Recency     int `json:"recency"`
+}
+
+type MonthlyScore struct {
+	Month string `json:"month"`
+	Score int    `json:"score"`
+}
+
+type userService struct {
+	repo       Repository
+	circleRepo circle.Repository
+}
+
+func NewService(repo Repository, circleRepo circle.Repository) Service {
+	return &userService{repo: repo, circleRepo: circleRepo}
+}
+
+func parseUUID(id string) (uuid.UUID, error) {
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, ErrInvalidUUID
+	}
+	return parsed, nil
+}
+
+func (s *userService) GetByID(ctx context.Context, id string) (*User, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return nil, err
+	}
+	u, err := s.repo.FindByID(ctx, uid)
+	if err != nil {
+		if err == apperrors.ErrNotFound {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("getting user by id: %w", err)
+	}
+	return u, nil
+}
+
+func (s *userService) GetByWallet(ctx context.Context, wallet string) (*User, error) {
+	u, err := s.repo.FindByWalletAddress(ctx, wallet)
+	if err != nil {
+		if err == apperrors.ErrNotFound {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("getting user by wallet: %w", err)
+	}
+	return u, nil
+}
+
+func (s *userService) GetByEmail(ctx context.Context, email string) (*User, error) {
+	u, err := s.repo.FindByEmail(ctx, email)
+	if err != nil {
+		if err == apperrors.ErrNotFound {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("getting user by email: %w", err)
+	}
+	return u, nil
+}
+
+func (s *userService) Create(ctx context.Context, wallet string) (*User, error) {
+	existing, err := s.repo.FindByWalletAddress(ctx, wallet)
+	if err == nil && existing != nil {
+		return existing, nil
+	}
+	if err != nil && err != apperrors.ErrNotFound {
+		return nil, fmt.Errorf("checking existing user: %w", err)
+	}
+
+	now := time.Now().UTC()
+	u := &User{
+		ID:                uuid.New(),
+		WalletAddress:     wallet,
+		PreferredLanguage: "en",
+		MoiScore:          0,
+		Role:              RoleUser,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+	if err := s.repo.Create(ctx, u); err != nil {
+		if err == apperrors.ErrConflict {
+			existing, findErr := s.repo.FindByWalletAddress(ctx, wallet)
+			if findErr != nil {
+				return nil, fmt.Errorf("conflict resolution failed: %w", findErr)
+			}
+			return existing, nil
+		}
+		return nil, fmt.Errorf("creating user: %w", err)
+	}
+	return u, nil
+}
+
+func (s *userService) Delete(ctx context.Context, id string) error {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	if err := s.repo.Delete(ctx, uid); err != nil {
+		return fmt.Errorf("deleting user: %w", err)
+	}
+	return nil
+}
+
+func (s *userService) UpdateProfile(ctx context.Context, id string, updates UpdateProfileInput) (*User, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	u, err := s.repo.FindByID(ctx, uid)
+	if err != nil {
+		if err == apperrors.ErrNotFound {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("finding user for update: %w", err)
+	}
+
+	if updates.DisplayName != nil {
+		u.DisplayName = updates.DisplayName
+	}
+	if updates.Email != nil {
+		hashed := HashEmail(*updates.Email)
+		u.Email = &hashed
+	}
+	if updates.Phone != nil {
+		u.Phone = updates.Phone
+	}
+	if updates.CountryCode != nil {
+		u.CountryCode = updates.CountryCode
+	}
+	if updates.PreferredLanguage != nil {
+		u.PreferredLanguage = *updates.PreferredLanguage
+	}
+	if updates.SessionTTL != nil {
+		ttl := *updates.SessionTTL
+		if ttl < 60 {
+			ttl = 60
+		}
+		if ttl > 1440 {
+			ttl = 1440
+		}
+		u.SessionTTLMinutes = ttl
+	}
+	u.UpdatedAt = time.Now().UTC()
+
+	if err := s.repo.Update(ctx, u); err != nil {
+		return nil, fmt.Errorf("updating profile: %w", err)
+	}
+	return u, nil
+}
+
+// UpdateNotificationPreferences persists the user's notification channel list
+// and mute flag. It validates that every channel name is one of the known
+// values before saving.
+func (s *userService) UpdateNotificationPreferences(ctx context.Context, id string, prefs NotificationPrefsInput) (*User, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	validChannels := map[string]struct{}{
+		"inapp": {}, "email": {}, "sms": {}, "push": {},
+	}
+	for _, ch := range prefs.Channels {
+		if _, ok := validChannels[ch]; !ok {
+			return nil, fmt.Errorf("invalid notification channel %q: must be one of inapp, email, sms, push", ch)
+		}
+	}
+
+	u, err := s.repo.FindByID(ctx, uid)
+	if err != nil {
+		if err == apperrors.ErrNotFound {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("finding user for notification prefs update: %w", err)
+	}
+
+	u.NotificationChannels = prefs.Channels
+	u.NotificationsMuted = prefs.Muted
+	u.UpdatedAt = time.Now().UTC()
+
+	// Digest cadence (#415). Both fields are optional so a client that only
+	// manages channels/mute leaves the digest setting untouched. Enabling
+	// digesting without naming an interval gets the default cadence rather
+	// than a zero value, which would otherwise flush on every event.
+	if prefs.DigestIntervalMinutes != nil {
+		interval := *prefs.DigestIntervalMinutes
+		if interval < MinDigestIntervalMinutes || interval > MaxDigestIntervalMinutes {
+			return nil, fmt.Errorf("invalid digest interval %d minutes: must be between %d and %d",
+				interval, MinDigestIntervalMinutes, MaxDigestIntervalMinutes)
+		}
+		u.DigestIntervalMinutes = interval
+	}
+	if prefs.DigestEnabled != nil {
+		u.DigestEnabled = *prefs.DigestEnabled
+	}
+	if u.DigestEnabled && u.DigestIntervalMinutes == 0 {
+		u.DigestIntervalMinutes = DefaultDigestIntervalMinutes
+	}
+
+	if err := s.repo.Update(ctx, u); err != nil {
+		return nil, fmt.Errorf("saving notification preferences: %w", err)
+	}
+	return u, nil
+}
+
+func (s *userService) GetMoiScore(ctx context.Context, id string) (*MoiScoreResponse, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	u, err := s.repo.FindByID(ctx, uid)
+	if err != nil {
+		if err == apperrors.ErrNotFound {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("finding user for moi score: %w", err)
+	}
+
+	level := calcLevel(u.MoiScore)
+
+	return &MoiScoreResponse{
+		Score: u.MoiScore,
+		Level: level,
+		Breakdown: MoiBreakdown{
+			Streaks:     int(math.Min(float64(u.MoiScore)*0.35, 350)),
+			Completions: int(math.Min(float64(u.MoiScore)*0.30, 300)),
+			Volume:      int(math.Min(float64(u.MoiScore)*0.20, 200)),
+			Recency:     int(math.Min(float64(u.MoiScore)*0.15, 150)),
+		},
+		History: make([]MonthlyScore, 0),
+	}, nil
+}
+
+func (s *userService) ClaimName(ctx context.Context) (string, error) {
+	counter, err := s.repo.ClaimNextName(ctx)
+	if err != nil {
+		return "", fmt.Errorf("claiming name: %w", err)
+	}
+	return generateName(counter), nil
+}
+
+func (s *userService) GetCircles(ctx context.Context, id string) ([]any, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = s.repo.FindByID(ctx, uid)
+	if err != nil {
+		if err == apperrors.ErrNotFound {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("finding user for circles: %w", err)
+	}
+
+	circles, err := s.circleRepo.FindCirclesByUserID(ctx, uid)
+	if err != nil {
+		return nil, fmt.Errorf("finding circles for user: %w", err)
+	}
+
+	result := make([]any, len(circles))
+	for i := range circles {
+		result[i] = circles[i]
+	}
+	return result, nil
+}
+
+func (s *userService) IsEmailTaken(ctx context.Context, email string) (bool, error) {
+	_, err := s.repo.FindByEmail(ctx, email)
+	if err == nil {
+		return true, nil
+	}
+	if err != nil && err != apperrors.ErrNotFound {
+		return false, fmt.Errorf("checking email availability in users: %w", err)
+	}
+	return false, nil
+}
+
+func calcLevel(score int) string {
+	switch {
+	case score > 800:
+		return "Diamond"
+	case score > 600:
+		return "Platinum"
+	case score > 400:
+		return "Gold"
+	case score > 200:
+		return "Silver"
+	default:
+		return "Bronze"
+	}
+}
+
+// Update persists the given user record as-is.
+func (s *userService) Update(ctx context.Context, u *User) error {
+	return s.repo.Update(ctx, u)
+}

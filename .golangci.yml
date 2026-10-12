@@ -1,0 +1,33 @@
+linters:
+  disable-all: true
+  enable:
+    - gofmt
+    - ineffassign
+    - forbidigo
+
+linters-settings:
+  forbidigo:
+    forbid:
+      - p: '^fmt\.Print(f|ln)?$'
+        msg: use the structured logger (pkg/logger or zerolog) instead
+      - p: '^log\.Print(f|ln)?$'
+        msg: use the structured logger (pkg/logger or zerolog) instead
+      - p: '^print(ln)?$'
+        msg: use the structured logger (pkg/logger or zerolog) instead
+      - p: '^(money\.)?Must(FromString|FromFloat64)$'
+        msg: 'money.Must* panicking constructors are forbidden in request paths; use money.FromString or money.FromFloat64 and return error'
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - forbidigo
+    - path: pkg/money/
+      linters:
+        - forbidigo
+    - path: cmd/seed/
+      linters:
+        - forbidigo
+    - path: cmd/migrate/
+      linters:
+        - forbidigo

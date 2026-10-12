@@ -1,0 +1,271 @@
+package websocket
+
+import (
+	"encoding/json"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	"github.com/rs/zerolog/log"
+
+	"github.com/deodes/backend/pkg/metrics"
+)
+
+const (
+	// Time allowed to write a message to the peer.
+	writeWait = 10 * time.Second
+
+	// Time allowed to read the next pong message from the peer.
+	pongWait = 60 * time.Second
+
+	// Send pings to peer with this period. Must be less than pongWait.
+	pingPeriod = (pongWait * 9) / 10
+
+	// Maximum message size allowed from peer.
+	maxMessageSize = 4096
+
+	// Send channel buffer size.
+	sendBufferSize = 256
+
+	// Max missed pings before closing stale connection.
+	maxMissedPings = 2
+)
+
+// Client represents a single WebSocket connection. It is created when a
+// client connects and destroyed when the connection is closed.
+type Client struct {
+	ID          string
+	UserID      string
+	Hub         *Hub
+	Conn        *websocket.Conn
+	Send        chan []byte
+	missedPings atomic.Int32
+	mu          sync.Mutex
+	closing     chan struct{}
+	closeOnce   sync.Once
+
+	// reconnectAfter is the backoff hint (nanoseconds) sent in the close
+	// frame on shutdown; zero means pick a default jittered delay.
+	reconnectAfter atomic.Int64
+	subscribeLimit tokenBucket
+}
+
+// NewClient creates a new Client bound to the given Hub and WebSocket
+// connection. The userID identifies the authenticated user.
+func NewClient(hub *Hub, conn *websocket.Conn, userID string) *Client {
+	return &Client{
+		ID:      uuid.New().String(),
+		UserID:  userID,
+		Hub:     hub,
+		Conn:    conn,
+		Send:    make(chan []byte, sendBufferSize),
+		closing: make(chan struct{}),
+	}
+}
+
+// Close asks the connection to shut down cleanly: the write pump sends a
+// close frame to the peer and both pumps exit, which unregisters the client
+// from the hub. It is safe to call from any goroutine and more than once.
+// Clients built without NewClient (no write pump) have their socket closed
+// directly.
+func (c *Client) Close() {
+	c.closeOnce.Do(func() {
+		if c.closing != nil {
+			close(c.closing)
+			return
+		}
+		if c.Conn != nil {
+			_ = c.Conn.Close()
+		}
+	})
+}
+
+// Disconnect tears the connection down without attempting a graceful close
+// frame. It is used to evict slow consumers: a client that cannot keep up may
+// have its WritePump blocked inside WriteMessage, so writing a close frame
+// first would block the publisher for up to writeWait and stall every other
+// subscriber. Closing the socket makes that blocked write fail at once and
+// reclaims the connection. The peer sees an abnormal closure and is expected
+// to reconnect; see docs/websocket-delivery.md.
+//
+// Clients built without NewClient (no Conn) are handled safely.
+func (c *Client) Disconnect() {
+	c.closeOnce.Do(func() {
+		if c.Conn != nil {
+			_ = c.Conn.Close()
+		}
+		if c.closing != nil {
+			close(c.closing)
+		}
+	})
+}
+
+// Kick closes the WebSocket connection immediately with a specific close code
+// and reason (e.g., CloseCircleMembershipRevoked).
+func (c *Client) Kick(code int, reason string) {
+	c.closeOnce.Do(func() {
+		if c.Conn != nil {
+			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+			_ = c.Conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(code, reason))
+			_ = c.Conn.Close()
+		}
+		if c.closing != nil {
+			close(c.closing)
+		}
+	})
+}
+
+// ReadPump pumps messages from the WebSocket connection to the hub.
+//
+// The application runs ReadPump in a per-connection goroutine. It ensures
+// there is at most one reader on a connection by executing all reads from
+// this goroutine. When the connection is closed, the client is unregistered.
+func (c *Client) ReadPump() {
+	defer func() {
+		c.Hub.Unregister(c)
+		c.Conn.Close()
+	}()
+
+	c.Conn.SetReadLimit(maxMessageSize)
+	c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.Conn.SetPongHandler(func(string) error {
+		c.missedPings.Store(0)
+		c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	for {
+		_, msgBytes, err := c.Conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(
+				err,
+				websocket.CloseGoingAway,
+				websocket.CloseAbnormalClosure,
+			) {
+				log.Warn().Err(err).Str("clientID", c.ID).Msg("websocket read error")
+			}
+			break
+		}
+		c.missedPings.Store(0)
+		c.handleMessage(msgBytes)
+	}
+}
+
+// WritePump pumps messages from the hub to the WebSocket connection.
+//
+// A goroutine running WritePump is started for each connection. It ensures
+// there is at most one writer by executing all writes from this goroutine.
+// Ping messages are sent periodically to keep the connection alive.
+// If 3 consecutive pings pass without a pong/heartbeat response, the connection
+// is closed to clean up stale connections.
+func (c *Client) WritePump() {
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.Conn.Close()
+	}()
+
+	for {
+		select {
+		case <-c.closing:
+			// Server is shutting down: tell the peer to reconnect elsewhere.
+			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+			delay := time.Duration(c.reconnectAfter.Load())
+			if delay <= 0 {
+				delay = reconnectDelay(reconnectSpread(0))
+			}
+			_ = c.Conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseGoingAway, shutdownCloseReason(delay)))
+			return
+		case msg, ok := <-c.Send:
+			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				// Hub closed the Send channel — close the connection
+				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.Conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				log.Warn().Err(err).Str("clientID", c.ID).Msg("websocket write error")
+				return
+			}
+		case <-ticker.C:
+			if c.missedPings.Load() >= maxMissedPings {
+				metrics.WSStaleConnectionsClosedTotal.Inc()
+				log.Warn().Str("clientID", c.ID).Int32("missedPings", c.missedPings.Load()).
+					Msg("closing stale websocket connection due to missed pings")
+				return
+			}
+			c.missedPings.Add(1)
+
+			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// MissedPings returns the current count of missed heartbeat pings.
+func (c *Client) MissedPings() int32 {
+	return c.missedPings.Load()
+}
+
+// ResetMissedPings resets the missed heartbeat ping count to 0.
+func (c *Client) ResetMissedPings() {
+	c.missedPings.Store(0)
+}
+
+// sendError writes a simple error message to the client if the send buffer
+// has room.
+func (c *Client) sendError(message string) {
+	data, _ := json.Marshal(map[string]string{"type": "error", "message": message})
+	select {
+	case c.Send <- data:
+	default:
+	}
+}
+
+// handleMessage processes a single incoming WebSocket message.
+// Supported message types:
+//   - "ping": responds with a pong
+//   - "subscribe": joins a circle room (requires "circleId" field)
+//   - "unsubscribe": leaves a circle room (requires "circleId" field)
+func (c *Client) handleMessage(data []byte) {
+	var msg map[string]any
+	if err := json.Unmarshal(data, &msg); err != nil {
+		log.Debug().Err(err).Str("clientID", c.ID).Msg("invalid websocket message")
+		return
+	}
+
+	msgType, _ := msg["type"].(string)
+	switch msgType {
+	case "ping":
+		select {
+		case c.Send <- []byte(`{"type":"pong"}`):
+		default:
+		}
+	case "subscribe":
+		circleID, _ := msg["circleId"].(string)
+		if circleID == "" {
+			return
+		}
+		if !c.subscribeLimit.allow(time.Now(), subscribeBurst, subscribeRefill) {
+			c.sendError("rate limited: too many subscribe requests")
+			return
+		}
+		if !c.Hub.JoinRoom(circleID, c.ID) {
+			c.sendError("forbidden: not a circle member")
+			return
+		}
+	case "unsubscribe":
+		circleID, _ := msg["circleId"].(string)
+		if circleID != "" {
+			c.Hub.LeaveRoom(circleID, c.ID)
+		}
+	default:
+		log.Debug().Str("type", msgType).Str("clientID", c.ID).Msg("unknown message type")
+	}
+}

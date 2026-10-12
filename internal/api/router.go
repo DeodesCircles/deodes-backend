@@ -1,0 +1,369 @@
+package api
+
+import (
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/deodes/backend/config"
+	"github.com/deodes/backend/internal/api/handler"
+	"github.com/deodes/backend/internal/api/middleware"
+	"github.com/deodes/backend/webhook"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
+)
+
+// perResource is a small helper so route registration below doesn't have to
+// repeat the redisClient/resource/limit/window/fail-closed boilerplate for
+// every sensitive route (#197 — PerResourceRateLimitMiddleware existed but
+// was never applied to any route).
+func perResource(redisClient *redis.Client, resource string, limit, windowSeconds int) gin.HandlerFunc {
+	return middleware.PerResourceRateLimitMiddleware(
+		redisClient,
+		resource,
+		limit,
+		time.Duration(windowSeconds)*time.Second,
+		middleware.WithFailClosed(),
+	)
+}
+
+// liveLimitOptions wires the hot-reloadable rate limits into a middleware when
+// the config carries a reloader.
+func liveLimitOptions(cfg *config.Config) []middleware.RateLimitOption {
+	if cfg.Hot == nil {
+		return nil
+	}
+	return []middleware.RateLimitOption{middleware.WithLiveLimits(cfg.Hot.RateLimit)}
+}
+
+func NewRouter(
+	cfg *config.Config,
+	redisClient *redis.Client,
+	authHandler *handler.AuthHandler,
+	userHandler *handler.UserHandler,
+	circleHandler *handler.CircleHandler,
+	contributionHandler *handler.ContributionHandler,
+	payoutHandler *handler.PayoutHandler,
+	inviteHandler *handler.InviteHandler,
+	notificationHandler *handler.NotificationHandler,
+	adminHandler *handler.AdminHandler,
+	webhookHandler *handler.WebhookHandler,
+	healthHandler *handler.HealthHandler,
+	passkeyCredentialHandler *handler.PasskeyCredentialHandler,
+	walletHandler *handler.WalletHandler,
+	depositHandler *handler.DepositHandler,
+	mobileMoneyHandler *handler.MobileMoneyHandler,
+	chatHandler *handler.ChatHandler,
+	communityHandler *handler.CommunityHandler,
+	wsHandler *handler.WebSocketHandler,
+	savingsGoalHandler *handler.SavingsGoalHandler,
+	tokenHandler *handler.TokenHandler,
+	swapHandler *handler.SwapHandler,
+	governanceHandler *handler.GovernanceHandler,
+	reputationHandler *handler.ReputationHandler,
+	referralHandler *handler.ReferralHandler,
+	consentHandler *handler.ConsentHandler,
+	adminJobQueueHandler *handler.AdminJobQueueHandler,
+	adminIndexerHandler *handler.AdminIndexerHandler,
+	webhookRepo webhook.WebhookRepository,
+	yellowCardWebhookHandler *handler.YellowCardWebhookHandler,
+	jwtPublicKey []byte,
+) *gin.Engine {
+	r := gin.New()
+
+	// CSRF boundary (#399). CSRF tokens are bound to the bearer session, so they
+	// are enforced wherever a request is authenticated:
+	//   - wsRoute, authenticated (and admin, nested in it): always enforced.
+	//   - optional: enforced when an Authorization header is present
+	//     (CSRFTokenValidatorIfAuthenticated); anonymous callers have no session.
+	// Exempt by design (no user session to protect / not browser-initiated):
+	//   - /webhooks/incoming/:id, /webhooks/yellowcard: server-to-server,
+	//     verified by the webhook handlers themselves.
+	//   - /v1/auth/{register,register/verify,refresh,nonce,verify}: they create
+	//     or exchange the session, so no CSRF token can exist yet.
+	//   - /v1/claim-name: anonymous, not user-bound (allocates the next name).
+	// TestRouter_CSRFCoverage enforces this: any new state-changing route must be
+	// CSRF-enforced or explicitly added to its exemption list.
+
+	r.Use(middleware.RecoveryMiddleware())
+	r.Use(middleware.TracingMiddleware(cfg.Tracing.ServiceName))
+	r.Use(middleware.LoggingMiddleware())
+	r.Use(middleware.CORSMiddleware(cfg.CORS))
+	r.Use(middleware.PrometheusMiddleware())
+
+	// Request body cap (#445). Mounted after CORS so a 413 still carries the
+	// CORS headers browsers need, and after Prometheus so rejected requests
+	// are still counted. It runs ahead of auth and rate limiting, so an
+	// oversized payload is discarded before any expensive work happens.
+	r.Use(middleware.BodyLimit(cfg.Server.MaxBodyBytes, cfg.Server.MaxBodyBytesRoutes))
+
+	// Prometheus metrics endpoint — protected by admin API key (primary + secondary for zero-downtime rotation), un-rate-limited
+	r.GET("/metrics", middleware.AdminAPIKeyMiddleware(cfg.Auth.AdminAPIKey, cfg.Auth.AdminAPIKeySecondary), gin.WrapH(promhttp.Handler()))
+
+	r.Use(middleware.RateLimitMiddleware(redisClient, cfg.RateLimit, liveLimitOptions(cfg)...))
+
+	r.GET("/health", healthHandler.Health)
+	r.GET("/health/ready", healthHandler.Readiness)
+	r.GET("/health/live", healthHandler.Liveness)
+	r.GET("/internal/indexer/lag", healthHandler.IndexerLag)
+
+	swaggerH := handler.NewSwaggerHandler()
+	r.GET("/api-docs", swaggerH.ServeUI)
+	r.GET("/api-docs/openapi.json", swaggerH.ServeJSON)
+
+	// Public webhooks (idempotency-keyed internally)
+	r.POST("/webhooks/incoming/:id", handler.NewIncomingWebhookHandler(webhookRepo).ReceiveWebhook)
+	r.POST("/webhooks/yellowcard", yellowCardWebhookHandler.HandleWebhook)
+
+	// WebSocket — real-time events
+	wsRoute := r.Group("")
+	wsRoute.Use(middleware.AuthMiddleware(jwtPublicKey))
+	wsRoute.Use(middleware.TokenBlocklistMiddleware(redisClient))
+	wsRoute.Use(middleware.CSRFTokenValidator(redisClient))
+	{
+		wsRoute.GET("/ws", wsHandler.HandleWebSocket)
+	}
+
+	api := r.Group("/v1")
+	{
+		auth := api.Group("/auth")
+		auth.Use(middleware.AuthRateLimitMiddleware(redisClient, cfg.RateLimit, liveLimitOptions(cfg)...))
+		{
+			auth.POST("/register", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.Register)
+			auth.POST("/register/verify", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.RegisterVerify)
+			auth.POST("/refresh", middleware.RefreshTokenBlocklistMiddleware(redisClient), authHandler.Refresh)
+			auth.POST("/nonce", authHandler.Nonce)
+			auth.POST("/verify", authHandler.Verify)
+		}
+
+		// User & Profile routes (authenticated)
+		// Public — claim a unique anonymous name (before auth). Registered on the
+		// bare api group (no auth, so no CSRF session); see the CSRF boundary
+		// note above. Kept out of the authenticated block below so it can't be
+		// mistaken for an authenticated route.
+		api.POST("/claim-name", userHandler.ClaimName)
+
+		authenticated := api.Group("")
+		authenticated.Use(middleware.AuthMiddleware(jwtPublicKey))
+		authenticated.Use(middleware.TokenBlocklistMiddleware(redisClient))
+		authenticated.Use(middleware.CSRFTokenValidator(redisClient))
+		// Idempotency must run after AuthMiddleware so keys are scoped per
+		// user (#198) — a global, pre-auth middleware let idempotency keys
+		// collide across different users' requests.
+		authenticated.Use(middleware.IdempotencyMiddleware(redisClient))
+		// Idempotency audit (#393). Every POST/PUT/PATCH/DELETE registered on
+		// `authenticated` (and its `admin` sub-group) runs IdempotencyMiddleware
+		// above. That middleware is opt-in per request, so routes that move
+		// funds or cast a binding vote/bid additionally mount requireIdem,
+		// making the Idempotency-Key header mandatory there:
+		//   wallets/withdraw, wallet/deposit, wallet/withdraw,
+		//   wallet/mobile-money/{onramp,offramp}, circles/:id/{contribute,
+		//   payout,vote,auction-bid}, circles/:id/invites,
+		//   governance/proposals/:id/{vote,execute}, token/{stake,unstake},
+		//   swap/{offer,accept,cancel}.
+		// Intentionally NOT idempotency-wrapped: /v1/auth/* (pre-auth, keys
+		// would be unscoped — see #198), public webhooks (idempotent by
+		// provider event ID internally), POST /v1/claim-name (public,
+		// pre-auth) and optional-auth POST /v1/consent.
+		requireIdem := middleware.RequireIdempotencyKey()
+		{
+			authenticated.GET("/me", authHandler.Me)
+			authenticated.PATCH("/me", userHandler.UpdateProfile)
+			authenticated.PATCH("/users/me", userHandler.UpdateProfile)
+			authenticated.POST("/auth/logout", authHandler.Logout)
+			authenticated.POST("/auth/password/change", authHandler.ChangePassword)
+			authenticated.DELETE("/sessions/:id", authHandler.RevokeSessionByID)
+			emailChangeLimit := perResource(redisClient, "email-change", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds)
+			authenticated.POST("/auth/email/change", emailChangeLimit, authHandler.RequestEmailChange)
+			authenticated.POST("/auth/email/change/verify-current", emailChangeLimit, authHandler.VerifyCurrentEmail)
+			authenticated.POST("/auth/email/change/verify-new", emailChangeLimit, authHandler.VerifyNewEmail)
+
+			authenticated.POST("/users/username/claim", userHandler.ClaimName)
+
+			// Passkey credential store/retrieval
+			authenticated.POST("/credential", passkeyCredentialHandler.StoreCredential)
+			authenticated.GET("/credential", passkeyCredentialHandler.GetCredential)
+
+			// Wallet routes
+			authenticated.POST("/wallets", walletHandler.CreateWallet)
+			authenticated.GET("/wallets", walletHandler.ListWallets)
+			authenticated.GET("/wallets/balance", walletHandler.GetBalance)
+			authenticated.POST("/wallets/withdraw", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), walletHandler.Withdraw)
+			authenticated.DELETE("/wallets/:id", walletHandler.DeleteWallet)
+
+			// Authenticator (TOTP) enrollment. Code checks share the OTP
+			// limiter so six-digit codes cannot be brute-forced.
+			totpLimit := perResource(redisClient, "totp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds)
+			authenticated.POST("/auth/totp/enroll", authHandler.EnrollTOTP)
+			authenticated.POST("/auth/totp/enable", totpLimit, authHandler.EnableTOTP)
+			authenticated.POST("/auth/totp/verify", totpLimit, authHandler.VerifyTOTP)
+			authenticated.POST("/auth/totp/disable", totpLimit, authHandler.DisableTOTP)
+			authenticated.POST("/auth/totp/recovery-codes", totpLimit, authHandler.RegenerateTOTPRecoveryCodes)
+
+			// Deposit / Withdraw routes
+			authenticated.GET("/wallet/deposit/quote", depositHandler.GetDepositQuote)
+			authenticated.POST("/wallet/deposit", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), depositHandler.InitiateDeposit)
+			authenticated.POST("/wallet/withdraw", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), depositHandler.InitiateWithdraw)
+			authenticated.GET("/wallet/transactions/:yellowCardId", depositHandler.GetTransactionStatus)
+			authenticated.GET("/wallet/mobile-money/providers", mobileMoneyHandler.ListProviders)
+			authenticated.POST("/wallet/mobile-money/onramp", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), mobileMoneyHandler.InitiateOnramp)
+			authenticated.POST("/wallet/mobile-money/offramp", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), mobileMoneyHandler.InitiateOfframp)
+			authenticated.GET("/wallet/mobile-money/:id", mobileMoneyHandler.GetTransaction)
+
+			authenticated.POST("/chat/keys", chatHandler.PublishKeys)
+			authenticated.GET("/chat/keys/:userId", chatHandler.GetBundle)
+			authenticated.POST("/chat/conversations", chatHandler.CreateConversation)
+			authenticated.GET("/chat/conversations", chatHandler.ListConversations)
+			authenticated.POST("/chat/conversations/:id/messages", chatHandler.SendMessage)
+			authenticated.GET("/chat/conversations/:id/messages", chatHandler.ListMessages)
+
+			// Circles
+			authenticated.POST("/circles", circleHandler.CreateCircle)
+			authenticated.GET("/circles/:id", circleHandler.GetCircle)
+			authenticated.GET("/circles/:id/export", circleHandler.ExportCircle)
+			authenticated.PATCH("/circles/:id", circleHandler.UpdateCircle)
+			authenticated.POST("/circles/:id/start", circleHandler.StartCircle)
+			authenticated.POST("/circles/:id/payout", requireIdem, circleHandler.TriggerPayout)
+			authenticated.POST("/circles/:id/payout/preview", circleHandler.PreviewPayout)
+			authenticated.POST("/circles/:id/close", circleHandler.CloseCircle)
+			authenticated.DELETE("/circles/:id", circleHandler.CancelCircle)
+			authenticated.POST("/circles/:id/join", circleHandler.JoinCircle)
+			authenticated.POST("/circles/:id/contribute", requireIdem, perResource(redisClient, "contribute", cfg.RateLimit.ContributeLimit, cfg.RateLimit.ContributeWindowSeconds), circleHandler.Contribute)
+			authenticated.POST("/circles/:id/exit", circleHandler.ExitCircle)
+			authenticated.GET("/circles/:id/members", circleHandler.GetMembers)
+			authenticated.GET("/circles/:id/rounds", circleHandler.GetRounds)
+			authenticated.GET("/circles/:id/rounds/:round/config", circleHandler.GetRoundConfig)
+			authenticated.GET("/circles/:id/payouts", circleHandler.GetPayouts)
+			authenticated.POST("/circles/:id/dispute", circleHandler.Dispute)
+			authenticated.POST("/circles/:id/vote", requireIdem, circleHandler.Vote)
+			authenticated.POST("/circles/:id/auction-bid", requireIdem, circleHandler.AuctionBid)
+			authenticated.POST("/circles/:id/members/:address/remove", circleHandler.RemoveMember)
+
+			// Dashboard snapshot endpoints (replaces multi-call pattern — see #440)
+			authenticated.GET("/circles/snapshots", circleHandler.GetBulkSnapshots)
+			authenticated.GET("/circles/:id/snapshot", circleHandler.GetSnapshot)
+
+			authenticated.GET("/circles/:id/invites", inviteHandler.ListInvites)
+			authenticated.POST("/circles/:id/invites", requireIdem, inviteHandler.CreateInvite)
+			authenticated.DELETE("/invites/:code", inviteHandler.RevokeInvite)
+
+			authenticated.GET("/contributions", contributionHandler.ListContributions)
+			authenticated.GET("/contributions/:id", contributionHandler.GetContribution)
+
+			authenticated.GET("/payouts", payoutHandler.ListPayouts)
+			authenticated.GET("/payouts/:id", payoutHandler.GetPayout)
+
+			// Governance
+			authenticated.POST("/governance/proposals", governanceHandler.CreateProposal)
+			authenticated.GET("/governance/proposals", governanceHandler.ListProposals)
+			authenticated.GET("/governance/proposals/:id", governanceHandler.GetProposal)
+			authenticated.POST("/governance/proposals/:id/vote", requireIdem, governanceHandler.VoteProposal)
+			authenticated.POST("/governance/proposals/:id/execute", requireIdem, governanceHandler.ExecuteProposal)
+			// Cancellation inside the execution timelock (#414).
+			authenticated.POST("/governance/proposals/:id/cancel", requireIdem, governanceHandler.CancelProposal)
+
+			// Reputation tiers
+			authenticated.GET("/reputation/tiers", reputationHandler.GetTiers)
+			authenticated.GET("/reputation/tier/:address", reputationHandler.GetTierByAddress)
+
+			// Referral system
+			authenticated.POST("/referral/code", perResource(redisClient, "referral", cfg.RateLimit.ReferralLimit, cfg.RateLimit.ReferralWindowSeconds), referralHandler.GenerateCode)
+			authenticated.GET("/referral/stats", referralHandler.GetStats)
+			authenticated.GET("/referral/history", referralHandler.GetHistory)
+
+			// Communities
+			authenticated.POST("/communities", communityHandler.Create)
+			authenticated.GET("/communities", communityHandler.List)
+			authenticated.GET("/communities/:id", communityHandler.Get)
+			authenticated.GET("/communities/slug/:slug", communityHandler.GetBySlug)
+			authenticated.PATCH("/communities/:id", communityHandler.Update)
+			authenticated.DELETE("/communities/:id", communityHandler.Delete)
+			authenticated.POST("/communities/:id/join", communityHandler.Join)
+			authenticated.POST("/communities/:id/leave", communityHandler.Leave)
+			authenticated.GET("/communities/:id/members", communityHandler.GetMembers)
+			authenticated.GET("/communities/:id/membership", communityHandler.IsMember)
+			authenticated.POST("/communities/:id/announcements", communityHandler.CreateAnnouncement)
+			authenticated.GET("/communities/:id/announcements", communityHandler.GetAnnouncements)
+			authenticated.DELETE("/communities/:id/announcements/:announcementId", communityHandler.DeleteAnnouncement)
+			authenticated.POST("/communities/:id/announcements/:announcementId/like", communityHandler.LikeAnnouncement)
+			authenticated.PATCH("/communities/:id/announcements/:announcementId/pin", communityHandler.PinAnnouncement)
+			authenticated.DELETE("/communities/:id/members/:memberId", communityHandler.RemoveMember)
+			authenticated.POST("/communities/:id/transfer-ownership", communityHandler.TransferOwnership)
+			authenticated.GET("/communities/:id/activity", communityHandler.GetActivity)
+			authenticated.GET("/users/me/communities", communityHandler.GetMyCommunities)
+
+			authenticated.GET("/notifications", notificationHandler.ListNotifications)
+			authenticated.GET("/notifications/search", notificationHandler.SearchNotifications)
+			authenticated.PATCH("/notifications/:id/read", notificationHandler.MarkRead)
+			authenticated.PATCH("/notifications/read-all", notificationHandler.MarkAllRead)
+			authenticated.POST("/notifications/bulk-archive", notificationHandler.BulkArchive)
+			authenticated.POST("/notifications/bulk-unarchive", notificationHandler.BulkUnarchive)
+			authenticated.PUT("/notifications/preferences", notificationHandler.UpdatePreferences)
+
+			// Savings goals
+			authenticated.POST("/savings/goals", savingsGoalHandler.Create)
+			authenticated.GET("/savings/goals", savingsGoalHandler.List)
+			authenticated.GET("/savings/goals/active", savingsGoalHandler.ListActive)
+			authenticated.GET("/savings/goals/summary", savingsGoalHandler.Summary)
+			authenticated.GET("/savings/goals/obligations", savingsGoalHandler.UpcomingObligations)
+			authenticated.GET("/savings/goals/:id", savingsGoalHandler.Get)
+			authenticated.PATCH("/savings/goals/:id", savingsGoalHandler.Update)
+			authenticated.DELETE("/savings/goals/:id", savingsGoalHandler.Delete)
+			authenticated.POST("/savings/goals/:id/complete", savingsGoalHandler.Complete)
+
+			// Token routes
+			authenticated.GET("/token/balance/:address", tokenHandler.GetBalance)
+			authenticated.POST("/token/stake", requireIdem, tokenHandler.Stake)
+			authenticated.POST("/token/unstake", requireIdem, tokenHandler.Unstake)
+			authenticated.GET("/token/stakes/:address", tokenHandler.GetStakes)
+
+			// Swap endpoints
+			authenticated.POST("/swap/offer", requireIdem, perResource(redisClient, "swap", cfg.RateLimit.SwapLimit, cfg.RateLimit.SwapWindowSeconds), swapHandler.CreateSwapOffer)
+			authenticated.POST("/swap/accept", requireIdem, perResource(redisClient, "swap", cfg.RateLimit.SwapLimit, cfg.RateLimit.SwapWindowSeconds), swapHandler.AcceptSwapOffer)
+			authenticated.POST("/swap/cancel", requireIdem, perResource(redisClient, "swap", cfg.RateLimit.SwapLimit, cfg.RateLimit.SwapWindowSeconds), swapHandler.CancelSwapOffer)
+			authenticated.GET("/swap/history", swapHandler.GetSwapHistory)
+
+			authenticated.POST("/webhooks", webhookHandler.RegisterWebhook)
+			authenticated.GET("/webhooks", webhookHandler.ListWebhooks)
+			authenticated.GET("/webhooks/deliveries", webhookHandler.ListDeliveries)
+			authenticated.DELETE("/webhooks/:id", webhookHandler.DeleteWebhook)
+		}
+
+		admin := authenticated.Group("/admin")
+		admin.Use(middleware.AdminMiddleware())
+		admin.Use(perResource(redisClient, "admin", cfg.RateLimit.AdminLimit, cfg.RateLimit.AdminWindowSeconds))
+		{
+			admin.GET("/users", adminHandler.ListUsers)
+			// Registered before any /users/:id route so the static "deleted" segment
+			// is not captured by a wildcard parameter.
+			admin.GET("/users/deleted", adminHandler.ListDeletedUsers)
+			admin.POST("/users/:id/restore", adminHandler.RestoreUser)
+			admin.GET("/circles", adminHandler.ListCircles)
+			admin.GET("/circles/:id/inspect", adminHandler.InspectCircleState)
+			admin.GET("/audit-log", adminHandler.GetAuditLog)
+			admin.GET("/metrics", adminHandler.GetMetrics)
+			admin.GET("/feature-flags", adminHandler.ListFeatureFlags)
+			admin.GET("/feature-flags/:flag", adminHandler.GetFeatureFlag)
+			admin.POST("/feature-flags", adminHandler.UpdateFeatureFlag)
+			admin.DELETE("/feature-flags/:flag", adminHandler.DeleteFeatureFlag)
+			admin.GET("/jobs/dead-letter", adminJobQueueHandler.GetDeadLetterJobs)
+			admin.POST("/jobs/dead-letter/:id/retry", adminJobQueueHandler.RetryDeadLetterJob)
+			admin.GET("/indexer/dead-letter", adminIndexerHandler.GetDeadLetterEvents)
+			admin.POST("/indexer/dead-letter/:id/resolve", adminIndexerHandler.ResolveDeadLetterEvent)
+		}
+
+		optional := api.Group("")
+		optional.Use(middleware.OptionalAuthMiddleware(jwtPublicKey))
+		// Authenticated callers on optional-auth routes (e.g. POST /consent
+		// writing a signed-in user's consent) must pass CSRF too (#399).
+		optional.Use(middleware.CSRFTokenValidatorIfAuthenticated(redisClient))
+		{
+			optional.GET("/circles", circleHandler.ListCircles)
+
+			// GDPR cookie consent — works for both authenticated and anonymous users
+			optional.GET("/consent", consentHandler.GetConsent)
+			optional.POST("/consent", consentHandler.SaveConsent)
+		}
+	}
+
+	return r
+}

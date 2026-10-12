@@ -1,0 +1,235 @@
+name: "moistello: Auto-Fix"
+
+# The "moistello" bot auto-fixes ONLY its own mistakes:
+#   1. MERGE CONFLICTS on a PR that the BOT (opencode-agent[bot]) opened.
+#   2. FAILING CI on master/main caused by a mistaken bot merge, OR on a
+#      PR opened by the bot.
+#
+# SCOPE GUARD (per repo policy): The bot NEVER touches human contributors'
+# own PRs or branches. It only cleans up conflicts/breakage it introduced.
+#
+# It NEVER assigns issues/reviewers. You assign those manually.
+
+on:
+  pull_request:
+    types: [ opened, reopened, synchronize, ready_for_review ]
+  workflow_run:
+    workflows: [ CI ]
+    types: [ completed ]
+
+concurrency:
+  group: fix-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  resolve-conflicts:
+    name: Resolve merge conflicts (bot PRs only)
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    steps:
+      # ----- SCOPE GUARD: only the bot's own PRs -----
+      - name: Confirm PR is owned by the bot
+        id: scope
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN || github.token }}
+        run: |
+          AUTHOR="$(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }} --jq '.user.login')"
+          echo "author=$AUTHOR"
+          if [ "$AUTHOR" = "opencode-agent[bot]" ] || [ "$AUTHOR" = "moistello-bot[bot]" ]; then
+            echo "bot_pr=true" >> "$GITHUB_OUTPUT"
+            echo "Bot-owned PR — conflict resolution allowed."
+          else
+            echo "bot_pr=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Human/contributor PR ($AUTHOR) — bot will NOT resolve conflicts. Skipping."
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.scope.outputs.bot_pr == 'true'
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Checkout base branch for comparison
+        if: steps.scope.outputs.bot_pr == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN || github.token }}
+        run: |
+          git fetch origin "${{ github.event.pull_request.base.ref }}:${{ github.event.pull_request.base.ref }}"
+          git fetch origin "${{ github.event.pull_request.head.ref }}"
+
+      - name: Attempt to rebase PR onto base
+        id: rebase
+        if: steps.scope.outputs.bot_pr == 'true'
+        run: |
+          git config user.name "moistello-bot[bot]"
+          git config user.email "bot@users.noreply.github.com"
+          if git rebase "origin/${{ github.event.pull_request.base.ref }}"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            echo "Rebase succeeded."
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "Rebase failed — merge conflict detected."
+          fi
+
+      - name: Push clean rebase
+        if: steps.scope.outputs.bot_pr == 'true' && steps.rebase.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN || github.token }}
+        run: |
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}" \
+            || echo "Nothing to push (branch already up to date)."
+
+      # ----- Only reach here when there is a genuine merge conflict -----
+      - name: Skip AI resolution when no LLM key configured
+        id: llm
+        if: steps.scope.outputs.bot_pr == 'true' && steps.rebase.outputs.conflict == 'true'
+        env:
+          LLM_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          if [ -n "$LLM_KEY" ]; then echo "configured=true" >> "$GITHUB_OUTPUT"; else echo "configured=false" >> "$GITHUB_OUTPUT"; fi
+
+      # Wait until DeepSeek's OFF-PEAK window before spending tokens.
+      # Peak: 01:00-04:00 and 06:00-10:00 UTC. Off-peak: every other hour.
+      - name: Wait for off-peak hours
+        if: steps.scope.outputs.bot_pr == 'true' && steps.rebase.outputs.conflict == 'true' && steps.llm.outputs.configured == 'true'
+        run: |
+          h=$(date -u +%-H)
+          next=0
+          if (( h >= 1 && h < 4 )); then next=$((4*3600)); fi
+          if (( h >= 6 && h < 10 )); then next=$((10*3600)); fi
+          now=$(( $(date -u +%-H)*3600 + $(date -u +%-M)*60 + $(date -u +%-S) ))
+          if (( next > now )); then
+            wait=$(( next - now ))
+            echo "Peak hours — waiting ${wait}s until off-peak pricing..."
+            sleep "$wait"
+          else
+            echo "Off-peak — proceeding now."
+          fi
+
+      - name: Cache opencode CLI + tooling
+        if: steps.scope.outputs.bot_pr == 'true' && steps.rebase.outputs.conflict == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: opencode-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            opencode-${{ runner.os }}-
+
+      - name: AI-resolve the merge conflict against the full codebase
+        if: steps.scope.outputs.bot_pr == 'true' && steps.rebase.outputs.conflict == 'true' && steps.llm.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN || github.token }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_MODEL: ${{ secrets.OPENCODE_MODEL || 'opencode/mimo-v2.5-free' }}
+        run: |
+          git config user.name "moistello-bot[bot]"
+          git config user.email "bot@users.noreply.github.com"
+
+          npm install -g opencode-ai 2>/dev/null || npx opencode --version >/dev/null 2>&1 || true
+
+          opencode run \
+            --model "${OPENCODE_MODEL}" \
+            "The repository is mid-rebase with merge conflicts against branch
+             ${{ github.event.pull_request.base.ref }} on PR #${{ github.event.pull_request.number }}.
+             Use the full codebase as context. Resolve every conflict correctly so that both
+             the incoming and the current changes are preserved correctly, keep the code
+             consistent and compiling, and complete the rebase (git add + git rebase --continue
+             yourself). Do NOT introduce unrelated changes. Do NOT assign or change issues."
+
+          git add -A 2>/dev/null || true
+          if git rev-parse -q --verify REBASE_HEAD >/dev/null; then
+            GIT_EDITOR=true git rebase --continue 2>/dev/null || \
+              git rebase --abort && echo "Rebase aborted — agent could not auto-resolve."
+          fi
+
+          if git diff --quiet origin/"${{ github.event.pull_request.head.ref }}" 2>/dev/null; then
+            echo "No net changes vs remote; nothing to push."
+          else
+            git push origin "HEAD:${{ github.event.pull_request.head.ref }}" --force-with-lease \
+              || echo "Push failed (branch changed concurrently)."
+          fi
+
+  fix-ci:
+    name: AI-fix failing CI (bot merges/PRs only)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 0
+
+      # ----- SCOPE GUARD: only bot-introduced breakage -----
+      # Allowed when: the failing branch is master/main (a mistaken bot merge
+      # broke main) OR the branch belongs to a bot-opened PR. Human PRs are skipped.
+      - name: Confirm failure is bot-introduced
+        id: scope
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN || github.token }}
+        run: |
+          BRANCH="${{ github.event.workflow_run.head_branch }}"
+          echo "branch=$BRANCH"
+          if [ "$BRANCH" = "master" ] || [ "$BRANCH" = "main" ]; then
+            echo "bot_introduced=true" >> "$GITHUB_OUTPUT"
+            echo "Failure on $BRANCH — treating as possible mistaken bot merge. Proceeding."
+            exit 0
+          fi
+          PR_JSON="$(gh pr list --repo "${{ github.repository }}" --head "$BRANCH" --json number,user --jq '.[0]' 2>/dev/null)"
+          AUTHOR="$(echo "$PR_JSON" | jq -r '.user.login // ""')"
+          echo "pr_author=$AUTHOR"
+          if [ "$AUTHOR" = "opencode-agent[bot]" ] || [ "$AUTHOR" = "moistello-bot[bot]" ]; then
+            echo "bot_introduced=true" >> "$GITHUB_OUTPUT"
+            echo "Bot-owned PR ($AUTHOR) CI failure — proceeding."
+          else
+            echo "bot_introduced=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Human/contributor branch ($AUTHOR) CI failure — bot will NOT auto-fix. Skipping."
+          fi
+
+      - name: Skip when no LLM key configured
+        id: llm
+        if: steps.scope.outputs.bot_introduced == 'true'
+        env:
+          LLM_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          if [ -n "$LLM_KEY" ]; then echo "configured=true" >> "$GITHUB_OUTPUT"; else echo "configured=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Cache opencode CLI + node tooling
+        if: steps.scope.outputs.bot_introduced == 'true' && steps.llm.outputs.configured == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: opencode-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            opencode-${{ runner.os }}-
+
+      - name: Diagnose and fix the failing CI with opencode
+        if: steps.scope.outputs.bot_introduced == 'true' && steps.llm.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN || github.token }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_MODEL: ${{ secrets.OPENCODE_MODEL || 'opencode/mimo-v2.5-free' }}
+        run: |
+          git config user.name "moistello-bot[bot]"
+          git config user.email "bot@users.noreply.github.com"
+          git checkout "${{ github.event.workflow_run.head_branch }}"
+
+          npm install -g opencode-ai 2>/dev/null || npx opencode --version >/dev/null 2>&1 || true
+
+          opencode run \
+            --model "${OPENCODE_MODEL}" \
+            "CI failed on branch ${{ github.event.workflow_run.head_branch }} (commit ${{ github.event.workflow_run.head_sha }}).
+             Inspect the full repository, run the failing commands to reproduce, fix the root cause(s),
+             and make CI green. Do not break other functionality and do not assign or change
+             issues/reviewers. After fixing, verify the tests pass."
+
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes produced; nothing to push."
+          else
+            git add -A
+            git commit -m "fix(ci): automated fix for failing CI (moistello bot)" || echo "nothing to commit"
+            git push origin "HEAD:${{ github.event.workflow_run.head_branch }}"
+          fi

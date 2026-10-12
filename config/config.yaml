@@ -1,0 +1,197 @@
+environment: development
+
+server:
+  port: 1100
+  host: "0.0.0.0"
+  read_timeout: "10s"
+  write_timeout: "30s"
+  max_header_bytes: 1048576
+  # Maximum request body accepted on write routes (POST/PUT/PATCH/DELETE).
+  # Anything larger is refused with 413 and the typed REQUEST_BODY_TOO_LARGE
+  # error before the request reaches a handler.
+  max_body_bytes: 4194304
+  # Per-route overrides, keyed by the route pattern. Use these for endpoints
+  # that legitimately accept larger payloads than the default, for example:
+  #   max_body_bytes_routes:
+  #     "/v1/wallets/withdraw": 1048576
+  max_body_bytes_routes: {}
+  # Time to keep serving after readiness flips to not-ready, so load
+  # balancers stop routing here before the listener closes. Set it to your
+  # platform's endpoint propagation time (a few seconds on Kubernetes).
+  shutdown_delay: "0s"
+  # Maximum time to drain in-flight requests after SIGTERM before the
+  # remaining connections are closed forcibly.
+  shutdown_timeout: "30s"
+
+database:
+  # Optional read replica (env MOISTELLO_DATABASE_REPLICA_URL). When set,
+  # whitelisted read-heavy analytics queries use it; otherwise the primary.
+  replica_url: ""
+  max_open_conns: 50
+  max_idle_conns: 10
+  conn_max_lifetime: "30m"
+  migration_path: ""
+
+redis:
+  url: "redis://localhost:6379"
+  password: ""
+  db: 0
+  pool_size: 20
+
+rabbitmq:
+  url: "amqp://guest:guest@localhost:5672/"
+  exchange: "moistello.events"
+  queues:
+    notifications: "moistello.notifications"
+    webhooks: "moistello.webhooks"
+
+stellar:
+  # Master key credentials MUST be provided via environment variables at runtime.
+  # Set the following before starting the server:
+  #   MOISTELLO_STELLAR_MASTER_SECRET_KEY=<your-secret-key>
+  #   MOISTELLO_STELLAR_MASTER_PUBLIC_KEY=<your-public-key>
+  # Never commit actual key values to source control.
+  network: "testnet"
+  horizon_url: "https://horizon-testnet.stellar.org"
+  soroban_rpc_url: "https://soroban-testnet.stellar.org"
+  network_passphrase: "Test SDF Network ; September 2015"
+  usdc_issuer: "GAX23V3WWDPPR5WRER3KTEUTDLSCGZYMSJY5FDRRKKCIQ4JADF5T27RC"
+  wallet_min_balance: 10.0
+
+auth:
+  # Provide JWT private/public keys either via the env vars JWT_PRIVATE_KEY /
+  # JWT_PUBLIC_KEY or by placing the PEM files at the configured paths below.
+  jwt_private_key_path: "./config/keys/jwt-private.pem"
+  jwt_public_key_path: "./config/keys/jwt-public.pem"
+  access_token_ttl: "240m"
+  refresh_token_ttl: "168h"
+  nonce_ttl: "5m"
+  # Expired-session reclamation runs only from the scheduled cleanup job
+  # (#374). Every replica schedules it with random jitter up to cleanup_jitter
+  # and the first to take the Redis cleanup lock performs the sweep.
+  cleanup_interval: "5m"
+  cleanup_jitter: "30s"
+
+security:
+  # Required secrets. Prefer loading them from .env during local development.
+  wallet_pepper: ""
+  passkey_pepper: ""
+  encryption_key: ""
+  argon2_time: 1
+  argon2_memory: 65536
+  argon2_threads: 4
+
+indexer:
+  poll_interval: "3s"
+  batch_size: 50
+  start_ledger: 0
+  max_cursor_lag: "2m"
+  # How many ledgers behind the cursor the reorg check inspects. This bounds
+  # both the per-poll cost and how deep a ledger reorganization can be detected
+  # and rolled back: a fork at or below the window boundary is reported as
+  # unrepairable rather than partially applied. <= 0 uses the 10 ledger default.
+  reorg_window: 10
+  stall_threshold: "5m"
+
+notification:
+  email:
+    provider: ""
+    api_key: ""
+    from_address: ""
+  sms:
+    provider: ""
+    account_sid: ""
+    auth_token: ""
+    from_number: ""
+  push:
+    fcm_server_key: ""
+
+# cors.allowed_origins is intentionally not set here. The allowed origins are
+# resolved per environment by config/cors.go:
+#   development -> http://localhost:1110, http://127.0.0.1:1110
+#   staging     -> https://staging.moistello.io
+#   production  -> https://app.moistello.io, https://www.moistello.io
+# Override with ALLOWED_ORIGINS (comma separated) or
+# MOISTELLO_CORS_ALLOWED_ORIGINS. A wildcard or loopback origin is rejected
+# outside development so a misconfigured deployment fails at startup.
+cors:
+  allowed_methods:
+    - "GET"
+    - "POST"
+    - "PATCH"
+    - "DELETE"
+    - "OPTIONS"
+  allowed_headers:
+    - "Authorization"
+    - "X-CSRF-Token"
+    - "Content-Type"
+    - "X-Request-ID"
+  allow_credentials: true
+  max_age: "24h"
+
+# logging.level and rate_limit.global/authenticated/auth are hot-reloaded when
+# this file changes; every other key requires a restart.
+rate_limit:
+  global: 100
+  authenticated: 300
+  auth: 10
+  # Single policy when Redis is unreachable: fail closed (503) by default —
+  # the same posture the legacy JS middleware/rateLimiter.js always had.
+  # Individual routes may opt into fail-open via the middleware options.
+  fail_closed: true
+
+logging:
+  level: "debug"
+  format: "json"
+  output: "stdout"
+
+yellow_card:
+  api_key: ""
+  api_secret: ""
+  webhook_secret: ""
+
+# Mobile-money bridge (#190, product-spec.md §7) for non-NGN markets.
+# Each provider is only registered at startup when its credentials are set.
+mobile_money:
+  callback_base_url: ""
+  reconcile_interval_minutes: 5
+  mpesa_consumer_key: ""
+  mpesa_consumer_secret: ""
+  mpesa_shortcode: ""
+  mpesa_passkey: ""
+  mpesa_security_credential: ""
+  mpesa_initiator_name: ""
+  mpesa_sandbox: true
+  mtn_subscription_key: ""
+  mtn_api_user: ""
+  mtn_api_key: ""
+  mtn_target_currency: ""
+  mtn_sandbox: true
+  airtel_client_id: ""
+  airtel_client_secret: ""
+  airtel_country: ""
+  airtel_target_currency: ""
+  airtel_sandbox: true
+
+swap:
+  # How often the sweep worker releases escrow for expired swap offers (#243).
+  sweep_interval: "1m"
+
+governance:
+  # How long a proposal that has passed its vote waits before it can be
+  # executed (#414). This is the window in which members can review the
+  # proposal and cancel it, instead of a passed proposal executing the instant
+  # anyone calls the execute endpoint. Set to "0s" to disable the timelock and
+  # restore immediate execution.
+  execution_timelock: "48h"
+  # Share of votes cast (for + against) that must vote to cancel a proposal
+  # while it sits inside its timelock. 33 means a third of voters.
+  cancel_threshold_pct: 33
+
+# Deployed Contract IDs (Testnet)
+contracts:
+  circle_factory: "CADZWDGER6PYEWVHZDZ5HMEV6A5TKFVD4EY4DSPUTEKAM2KDPEABGJQU"
+  circle: "CALNXOUPT267LRRUCIF6OICEVGVEVKH2D2SX3YURCB4JXLDOF5TXVPCN"
+  reputation_registry: "CCEEJKQCYO7CXBFZBSGHS6AK2CCBU2HY2HK4VXQDPZ3XX3X3KEDGXQ7K"
+  governance_token: "CDOBQSJZJD4RIE2V5Q2IOJ6PBPSE2FT46BCD5WXW64ZN4KEUMYGBX3CS"
+  treasury: "CASXVLHWI56BBKLZHDHCFMCXDWJ4XWEMZABVBUIQBPDHVK4UW6ICUSFI"

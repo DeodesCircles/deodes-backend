@@ -15,6 +15,7 @@ import (
 	"github.com/stellar/go/strkey"
 
 	"github.com/deodes/backend/pkg/apperrors"
+	"github.com/deodes/backend/pkg/arc"
 )
 
 type Service interface {
@@ -96,7 +97,25 @@ func (s *service) Verify(ctx context.Context, walletAddress, signature string) (
 		return false, fmt.Errorf("nonce from the future — clock skew detected")
 	}
 
-	sigBytes, err := hex.DecodeString(signature)
+	sigBytes, err := hex.DecodeString(strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(signature), "0x"), "0X"))
+	if err == nil && len(sigBytes) == 65 && arc.ValidateAddress(walletAddress) == nil {
+		// Arc EVM path: EIP-191 personal_sign of the raw nonce string.
+		recovered, recErr := arc.RecoverPersonalSigner(nonceStr, signature)
+		if recErr != nil {
+			return false, fmt.Errorf("recovering arc signer: %w", recErr)
+		}
+		valid := arc.SameSigner(recovered, walletAddress)
+		if valid {
+			// Atomically delete nonce on successful verification (single-use enforcement)
+			if err := s.redis.Del(ctx, key).Err(); err != nil {
+				// Set short expiry if deletion fails - nonce will expire naturally
+				_ = s.redis.Expire(ctx, key, 1*time.Second)
+			}
+		}
+		return valid, nil
+	}
+
+	sigBytes, err = hex.DecodeString(signature)
 	if err != nil {
 		return false, fmt.Errorf("decoding signature hex: %w", err)
 	}

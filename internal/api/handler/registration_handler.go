@@ -235,11 +235,17 @@ func (h *RegistrationHandler) RegisterVerify(c *gin.Context) {
 		return
 	}
 
-	// Derive wallet seed and create the on-chain wallet.
+	// Derive wallet seed and create wallets: legacy Stellar + hosted Arc 0x.
+	// Hosted Arc is canonical (Arc-only product) and returned so the
+	// frontend can display the auto-wallet immediately after signup.
+	var hostedAddress string
 	if h.walletSvc != nil {
 		if seed, seedErr := h.walletSvc.DeriveWalletSeed(ctx, req.Email); seedErr == nil {
 			// Ignore wallet creation errors — user is already persisted.
 			_, _ = h.walletSvc.CreateWallet(ctx, u.ID.String(), []byte(seed))
+			if hosted, hostedErr := h.walletSvc.CreateHostedArcWallet(ctx, u.ID.String(), []byte("hosted-arc:"+u.ID.String()+":"+seed)); hostedErr == nil && hosted != nil {
+				hostedAddress = hosted.PublicKey
+			}
 		}
 	}
 
@@ -257,5 +263,6 @@ func (h *RegistrationHandler) RegisterVerify(c *gin.Context) {
 		"token":        pair.AccessToken,
 		"refreshToken": pair.RefreshToken,
 		"csrfToken":    pair.CSRFToken,
+		"hostedWallet": hostedAddress,
 	})
 }

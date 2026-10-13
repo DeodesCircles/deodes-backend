@@ -163,6 +163,14 @@ func (m *mockWalletService) CreateWallet(ctx context.Context, userID string, pas
 	return args.Get(0).(*wallet.Wallet), args.Error(1)
 }
 
+func (m *mockWalletService) CreateHostedArcWallet(ctx context.Context, userID string, passkeySeed []byte) (*wallet.Wallet, error) {
+	args := m.Called(ctx, userID, passkeySeed)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*wallet.Wallet), args.Error(1)
+}
+
 func (m *mockWalletService) SignTransaction(ctx context.Context, walletID string, passkeySeed []byte, txnXDR string) (string, error) {
 	args := m.Called(ctx, walletID, passkeySeed, txnXDR)
 	return args.String(0), args.Error(1)
@@ -316,6 +324,7 @@ func TestAuthHandler_RegisterVerify_Success(t *testing.T) {
 		&auth.TokenPair{AccessToken: "jwt-token", RefreshToken: "refresh-token", CSRFToken: "csrf-token"}, nil,
 	)
 	env.walletMock().On("CreateWallet", mock.Anything, mock.AnythingOfType("string"), mock.AnythingOfType("[]uint8")).Return(nil, nil)
+	env.walletMock().On("CreateHostedArcWallet", mock.Anything, mock.AnythingOfType("string"), mock.AnythingOfType("[]uint8")).Return(&wallet.Wallet{PublicKey: "0x0000000000000000000000000000000000000001"}, nil)
 
 	verifyBody, _ := json.Marshal(map[string]string{
 		"email": testEmail,

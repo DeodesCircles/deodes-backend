@@ -5,9 +5,20 @@ import (
 
 	"github.com/deodes/backend/internal/domain/auth"
 	"github.com/deodes/backend/internal/domain/user"
+	"github.com/deodes/backend/pkg/arc"
 	"github.com/deodes/backend/pkg/response"
 	"github.com/deodes/backend/pkg/stellar"
 )
+
+func isWalletAddress(addr string) bool {
+	if err := stellar.ValidateAddress(addr); err == nil {
+		return true
+	}
+	if err := arc.ValidateAddress(addr); err == nil {
+		return true
+	}
+	return false
+}
 
 // WalletAuthHandler handles wallet-based authentication: obtaining a signed
 // nonce and verifying a wallet signature to establish a session.
@@ -26,7 +37,7 @@ func NewWalletAuthHandler(authSvc auth.Service, userSvc user.Service) *WalletAut
 // @Tags Authentication
 // @Accept json
 // @Produce json
-// @Param body body object true "Wallet address" { "walletAddress": "G..." }
+// @Param body body object true "Wallet address" { "walletAddress": "0x... or G..." }
 // @Success 200 {object} response.Envelope{data=object{nonce=string}}
 // @Failure 400 {object} response.Envelope
 // @Router /auth/nonce [post]
@@ -39,8 +50,8 @@ func (h *WalletAuthHandler) Nonce(c *gin.Context) {
 		return
 	}
 
-	if err := stellar.ValidateAddress(req.WalletAddress); err != nil {
-		response.BadRequest(c, "invalid wallet address: "+err.Error())
+	if !isWalletAddress(req.WalletAddress) {
+		response.BadRequest(c, "invalid wallet address: must be Arc 0x or Stellar G...")
 		return
 	}
 
@@ -57,7 +68,7 @@ func (h *WalletAuthHandler) Nonce(c *gin.Context) {
 // @Tags Authentication
 // @Accept json
 // @Produce json
-// @Param body body object true "Signature payload" { "walletAddress": "G...", "signature": "..." }
+// @Param body body object true "Signature payload" { "walletAddress": "0x... or G...", "signature": "..." }
 // @Success 200 {object} response.Envelope{data=object{token=string,refreshToken=string}}
 // @Failure 400 {object} response.Envelope
 // @Failure 401 {object} response.Envelope
@@ -72,9 +83,8 @@ func (h *WalletAuthHandler) Verify(c *gin.Context) {
 		return
 	}
 
-	u, err := h.userService.GetByWallet(c.Request.Context(), req.WalletAddress)
-	if err != nil {
-		response.NotFound(c, "account not found")
+	if !isWalletAddress(req.WalletAddress) {
+		response.BadRequest(c, "invalid wallet address: must be Arc 0x or Stellar G...")
 		return
 	}
 
@@ -82,6 +92,18 @@ func (h *WalletAuthHandler) Verify(c *gin.Context) {
 	if err != nil || !valid {
 		response.Unauthorized(c, "signature verification failed")
 		return
+	}
+
+	// Auto-provision-or-login: wallet-first users have no email account yet.
+	ctx := c.Request.Context()
+	u, err := h.userService.GetByWallet(ctx, req.WalletAddress)
+	if err != nil {
+		created, createErr := h.userService.Create(ctx, req.WalletAddress)
+		if createErr != nil {
+			response.NotFound(c, "account not found")
+			return
+		}
+		u = created
 	}
 
 	pair, err := h.authService.CreateSession(c.Request.Context(), u.ID, string(u.Role), sessionTTLFromUser(u), deviceInfoFromContext(c))

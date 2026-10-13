@@ -64,6 +64,7 @@ func newEmailConsistencyEnv(t *testing.T) *emailConsistencyEnv {
 
 	wallet.On("DeriveWalletSeed", mock.Anything, mock.AnythingOfType("string")).Return(testWalletSeed, nil)
 	wallet.On("CreateWallet", mock.Anything, mock.AnythingOfType("string"), mock.AnythingOfType("[]uint8")).Return(&walletDomain.Wallet{}, nil)
+	wallet.On("CreateHostedArcWallet", mock.Anything, mock.AnythingOfType("string"), mock.AnythingOfType("[]uint8")).Return(&walletDomain.Wallet{PublicKey: "0x0000000000000000000000000000000000000001"}, nil)
 
 	env.h = handler.NewAuthHandler(mockAuthSvc, userSvc, wallet, nil, verificationSvc, nil, nil, mockUserRepo)
 	return env

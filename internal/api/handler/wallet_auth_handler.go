@@ -1,10 +1,13 @@
 package handler
 
 import (
+	"errors"
+
 	"github.com/gin-gonic/gin"
 
 	"github.com/deodes/backend/internal/domain/auth"
 	"github.com/deodes/backend/internal/domain/user"
+	"github.com/deodes/backend/pkg/apperrors"
 	"github.com/deodes/backend/pkg/arc"
 	"github.com/deodes/backend/pkg/response"
 	"github.com/deodes/backend/pkg/stellar"
@@ -89,8 +92,20 @@ func (h *WalletAuthHandler) Verify(c *gin.Context) {
 	}
 
 	valid, err := h.authService.VerifySignature(c.Request.Context(), req.WalletAddress, req.Signature)
-	if err != nil || !valid {
-		response.Unauthorized(c, "signature verification failed")
+	if err != nil {
+		// Verification couldn't complete (no/expired nonce, store error):
+		// the client should retry with a fresh nonce, not the same payload.
+		if errors.Is(err, apperrors.ErrNonceExpired) {
+			response.Unauthorized(c, "signing session expired, please try again")
+		} else {
+			response.Unauthorized(c, "signature verification failed, please try again")
+		}
+		return
+	}
+	if !valid {
+		// Completed check, wrong signer: wallet signed with a different
+		// account than the nonce was issued for (or a contract wallet).
+		response.Unauthorized(c, "signature does not match wallet address")
 		return
 	}
 

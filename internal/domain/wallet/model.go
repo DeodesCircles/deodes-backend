@@ -12,6 +12,16 @@ const (
 	WalletTypeAuto      WalletType = "auto"
 	WalletTypeFreighter WalletType = "freighter"
 	WalletTypePasskey   WalletType = "passkey"
+	// WalletTypeHosted is a custodial per-user wallet under us (Arc 0x first):
+	// the backend derives, encrypts, stores and signs with the secret.
+	// UNIQUE(user_id, wallet_type) allows one hosted wallet per user.
+	WalletTypeHosted WalletType = "hosted"
+	// WalletTypeLinked is a self-custody Arc 0x wallet the user proved
+	// ownership of via a signed nonce (POST /v1/wallets/link). No secret is
+	// ever stored (EncryptedSecretKey/Nonce stay empty) and it is never
+	// primary. UNIQUE(user_id, wallet_type) allows one linked wallet per
+	// user; the address itself is globally unique via UNIQUE(public_key).
+	WalletTypeLinked WalletType = "linked"
 )
 
 // Balance represents the available XLM and USDC balances for a wallet.

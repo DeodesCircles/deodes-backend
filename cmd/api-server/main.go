@@ -22,7 +22,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/deodes/backend/config"
 	"github.com/deodes/backend/internal/api"
 	"github.com/deodes/backend/internal/api/handler"
@@ -34,7 +33,6 @@ import (
 	"github.com/deodes/backend/internal/domain/circle"
 	"github.com/deodes/backend/internal/domain/community"
 	"github.com/deodes/backend/internal/domain/contribution"
-	"github.com/deodes/backend/internal/domain/deposit"
 	"github.com/deodes/backend/internal/domain/email"
 	"github.com/deodes/backend/internal/domain/featureflag"
 	"github.com/deodes/backend/internal/domain/governance"
@@ -47,14 +45,13 @@ import (
 	"github.com/deodes/backend/internal/domain/reputation"
 	"github.com/deodes/backend/internal/domain/savings"
 	"github.com/deodes/backend/internal/domain/sms"
+	"github.com/deodes/backend/internal/domain/subscription"
 	"github.com/deodes/backend/internal/domain/swap"
 	"github.com/deodes/backend/internal/domain/token"
 	"github.com/deodes/backend/internal/domain/totp"
 	"github.com/deodes/backend/internal/domain/user"
 	"github.com/deodes/backend/internal/domain/verification"
 	"github.com/deodes/backend/internal/domain/wallet"
-	"github.com/deodes/backend/internal/domain/withdrawal"
-	"github.com/deodes/backend/internal/domain/yellowcard"
 	"github.com/deodes/backend/internal/indexer"
 	ws "github.com/deodes/backend/internal/websocket"
 	"github.com/deodes/backend/pkg/jobqueue"
@@ -67,6 +64,7 @@ import (
 	"github.com/deodes/backend/pkg/tracing"
 	"github.com/deodes/backend/pkg/validator"
 	"github.com/deodes/backend/webhook"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 )
 
@@ -384,6 +382,12 @@ func main() {
 		Argon2Time:    cfg.Security.Argon2Time,
 		Argon2Memory:  cfg.Security.Argon2Memory,
 		Argon2Threads: cfg.Security.Argon2Threads,
+		// Custodial hosted Arc wallets encrypt secrets with this key.
+		EncryptionKey: cfg.Security.EncryptionKey,
+		// Arc chain settings for hosted 0x balance reads and sends.
+		ArcRPCURL:       cfg.Arc.RPCURL,
+		ArcChainID:      cfg.Arc.ChainID,
+		ArcUSDCContract: cfg.Arc.USDCContract,
 	}
 	walletSvc, err := wallet.NewService(wallet.NewRepository(db), walletCfg)
 	if err != nil {
@@ -406,7 +410,8 @@ func main() {
 	wsH := handler.NewWebSocketHandler(wsHub, cfg.CORS.AllowedOrigins)
 	go wsHub.StartMembershipAuditor(context.Background(), 30*time.Second)
 
-	authH := handler.NewAuthHandler(authSvc, userSvc, walletSvc, totpSvc, verificationSvc, emailSvc, redisClient, userRepo)
+	authH := handler.NewAuthHandler(authSvc, userSvc, walletSvc, totpSvc, verificationSvc, emailSvc, redisClient, userRepo).
+		WithGoogle(authSvc, userSvc, userRepo, walletSvc, cfg.Google.ClientID)
 	userH := handler.NewUserHandler(userSvc)
 	circleH := handler.NewCircleHandler(circleSvc, inviteSvc, contribSvc, payoutSvc)
 	contribH := handler.NewContributionHandler(contribSvc, contribRepo)
@@ -428,22 +433,15 @@ func main() {
 	webhookH := handler.NewWebhookHandler(webhookRepo)
 	healthH := handler.NewHealthHandler(db.DB, redisClient, cfg.Stellar.SorobanRPCURL, cfg.Stellar.HorizonURL)
 	passkeyCredH := handler.NewPasskeyCredentialHandler(db)
-	walletH := handler.NewWalletHandler(walletSvc)
+	walletH := handler.NewWalletHandler(walletSvc, authSvc)
 
 	// Community service
 	communitySvc := community.NewService(communityRepo, wsBroadcaster)
 	communityH := handler.NewCommunityHandler(communitySvc)
 
-	// Yellow Card integration
-	ycClient := yellowcard.NewClient(cfg.YellowCard.APIKey, cfg.YellowCard.APISecret, cfg.Stellar.MasterPublicKey)
-	depositRepo := deposit.NewRepository(db)
-	withdrawalRepo := withdrawal.NewRepository(db)
-	depositH := handler.NewDepositHandler(ycClient, walletSvc).
-		WithRedis(redisClient).
-		WithConfig(cfg.YellowCard).
-		WithRepositories(depositRepo, withdrawalRepo).
-		WithFeatureFlags(featureFlagCache)
-	ycWebhookH := handler.NewYellowCardWebhookHandler(depositRepo, withdrawalRepo, cfg.YellowCard.WebhookSecret)
+	// Fiat ramp (Yellow Card) removed — local-currency deposits are coming
+	// soon. Re-add the ramp wiring here when a provider is chosen; the
+	// deposits/withdrawals tables stay dormant in the meantime.
 
 	// Mobile-money bridge (#190) — on/off-ramp for non-NGN markets. Each
 	// provider is only registered when its credentials are configured, so
@@ -551,6 +549,56 @@ func main() {
 	swapSweeper := swap.NewSweeper(swapSvc, redisClient, cfg.Swap.SweepInterval)
 	swapSweeper.Start(context.Background())
 
+	// Auto-debit subscription keeper: pulls scheduled contributions for
+	// members who opted into Auto circles. Nil keeper (no escrow address)
+	// is a no-op, so deployments configure escrow only when ready to debit.
+	// Sprint 2 wires OnEvent into the notification service (T-24h reminders
+	// today come from circle contribution deadlines, not the keeper).
+	var keeperLoop *subscription.Loop
+	keeperInterval := time.Duration(cfg.Keeper.IntervalMin) * time.Minute
+	keeperNotifier := subscription.NewNotifier(notificationSvc)
+	keeper, keeperErr := subscription.NewKeeper(subscription.KeeperConfig{
+		Repo:          subscription.NewRepository(db),
+		Wallets:       walletSvc,
+		Contrib:       contribSvc,
+		Circles:       circleSvc,
+		EscrowAddress: cfg.Keeper.EscrowAddress,
+		Notifier:      keeperNotifier,
+		OnEvent: func(ctx context.Context, e subscription.DebitEvent) {
+			log.Info().
+				Str("subscription", e.SubscriptionID).
+				Str("circle", e.CircleID).
+				Int("round", e.Round).
+				Str("outcome", string(e.Outcome)).
+				Str("reason", e.Reason).
+				Str("tx", e.TxHash).
+				Msg("subscription keeper decision")
+			// Member-facing outcome notifications ride the same notifier
+			// as reminders; failures are best-effort (the event log above
+			// is the source of truth for reconciliation).
+			switch e.Outcome {
+			case subscription.OutcomeDebited:
+				_ = keeperNotifier.NotifyDebited(ctx, e.UserID, e.CircleID, e.Amount, e.Round, e.TxHash)
+			case subscription.OutcomeFailed:
+				_ = keeperNotifier.NotifyDebitFailed(ctx, e.UserID, e.CircleID, e.Amount, e.Round, e.Reason)
+			case subscription.OutcomeSkippedLowBalance:
+				_ = keeperNotifier.NotifyContributionDue(ctx, e.UserID, e.CircleID, e.Amount, 0)
+			}
+		},
+	})
+	if keeperErr != nil {
+		// Missing escrow or wiring: log once, keep serving everything else.
+		log.Info().Err(keeperErr).Msg("subscription keeper disabled")
+	} else {
+		keeperLoop = subscription.NewLoop(subscription.LoopConfig{
+			Keeper:   keeper,
+			Redis:    redisClient,
+			Interval: keeperInterval,
+			Jitter:   cfg.Auth.CleanupJitter,
+		})
+		keeperLoop.Start(context.Background())
+	}
+
 	governanceRepo := governance.NewRepository(db)
 	// Both #418 and #414 configure the same service: weight is snapshotted at
 	// proposal creation so tokens moved mid-vote cannot change an outcome, and a
@@ -576,6 +624,9 @@ func main() {
 	// GDPR cookie consent handler
 	consentH := handler.NewConsentHandler(db.DB)
 
+	// Auto-debit subscriptions share the keeper's repository.
+	subscriptionH := handler.NewSubscriptionHandler(subscription.NewRepository(db), circleSvc)
+
 	// RabbitMQ connection for health checks and event publishing
 	rmqClient, rmqErr := rabbitmq.New(cfg.RabbitMQ)
 	if rmqErr != nil {
@@ -593,7 +644,7 @@ func main() {
 	adminJobQueueH := handler.NewAdminJobQueueHandler(jobQueue)
 	adminIndexerH := handler.NewAdminIndexerHandler(indexer.NewDeadLetterStore(db))
 
-	router := api.NewRouter(cfg, redisClient, authH, userH, circleH, contribH, payoutH, inviteH, notifH, adminH, webhookH, healthH, passkeyCredH, walletH, depositH, mobileMoneyH, chatH, communityH, wsH, savingsH, tokenH, swapH, governanceH, reputationH, referralH, consentH, adminJobQueueH, adminIndexerH, webhookRepo, ycWebhookH, jwtPublicKey)
+	router := api.NewRouter(cfg, redisClient, authH, userH, circleH, contribH, payoutH, inviteH, notifH, adminH, webhookH, healthH, passkeyCredH, walletH, mobileMoneyH, chatH, communityH, wsH, savingsH, tokenH, swapH, governanceH, reputationH, referralH, consentH, subscriptionH, adminJobQueueH, adminIndexerH, webhookRepo, jwtPublicKey)
 
 	// Shutdown order: fail readiness first so the load balancer stops sending
 	// traffic, drain in-flight HTTP requests (bounded by
@@ -615,6 +666,11 @@ func main() {
 			},
 			func(context.Context) { digestFlusher.Stop() },
 			func(context.Context) { swapSweeper.Stop() },
+			func(context.Context) {
+				if keeperLoop != nil {
+					keeperLoop.Stop()
+				}
+			},
 			func(context.Context) { sessionCleaner.Stop() },
 		},
 		CloseLast: []func(){

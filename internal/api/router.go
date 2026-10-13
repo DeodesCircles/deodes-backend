@@ -3,11 +3,11 @@ package api
 import (
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/deodes/backend/config"
 	"github.com/deodes/backend/internal/api/handler"
 	"github.com/deodes/backend/internal/api/middleware"
 	"github.com/deodes/backend/webhook"
+	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 )
@@ -50,7 +50,6 @@ func NewRouter(
 	healthHandler *handler.HealthHandler,
 	passkeyCredentialHandler *handler.PasskeyCredentialHandler,
 	walletHandler *handler.WalletHandler,
-	depositHandler *handler.DepositHandler,
 	mobileMoneyHandler *handler.MobileMoneyHandler,
 	chatHandler *handler.ChatHandler,
 	communityHandler *handler.CommunityHandler,
@@ -62,10 +61,10 @@ func NewRouter(
 	reputationHandler *handler.ReputationHandler,
 	referralHandler *handler.ReferralHandler,
 	consentHandler *handler.ConsentHandler,
+	subscriptionHandler *handler.SubscriptionHandler,
 	adminJobQueueHandler *handler.AdminJobQueueHandler,
 	adminIndexerHandler *handler.AdminIndexerHandler,
 	webhookRepo webhook.WebhookRepository,
-	yellowCardWebhookHandler *handler.YellowCardWebhookHandler,
 	jwtPublicKey []byte,
 ) *gin.Engine {
 	r := gin.New()
@@ -76,8 +75,7 @@ func NewRouter(
 	//   - optional: enforced when an Authorization header is present
 	//     (CSRFTokenValidatorIfAuthenticated); anonymous callers have no session.
 	// Exempt by design (no user session to protect / not browser-initiated):
-	//   - /webhooks/incoming/:id, /webhooks/yellowcard: server-to-server,
-	//     verified by the webhook handlers themselves.
+	//   - /webhooks/incoming/:id: server-to-server, verified by the handler.
 	//   - /v1/auth/{register,register/verify,refresh,nonce,verify}: they create
 	//     or exchange the session, so no CSRF token can exist yet.
 	//   - /v1/claim-name: anonymous, not user-bound (allocates the next name).
@@ -112,7 +110,6 @@ func NewRouter(
 
 	// Public webhooks (idempotency-keyed internally)
 	r.POST("/webhooks/incoming/:id", handler.NewIncomingWebhookHandler(webhookRepo).ReceiveWebhook)
-	r.POST("/webhooks/yellowcard", yellowCardWebhookHandler.HandleWebhook)
 
 	// WebSocket — real-time events
 	wsRoute := r.Group("")
@@ -134,6 +131,7 @@ func NewRouter(
 			auth.POST("/refresh", middleware.RefreshTokenBlocklistMiddleware(redisClient), authHandler.Refresh)
 			auth.POST("/nonce", authHandler.Nonce)
 			auth.POST("/verify", authHandler.Verify)
+			auth.POST("/google", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.Google)
 		}
 
 		// User & Profile routes (authenticated)
@@ -156,7 +154,7 @@ func NewRouter(
 		// above. That middleware is opt-in per request, so routes that move
 		// funds or cast a binding vote/bid additionally mount requireIdem,
 		// making the Idempotency-Key header mandatory there:
-		//   wallets/withdraw, wallet/deposit, wallet/withdraw,
+		//   wallets/withdraw,
 		//   wallet/mobile-money/{onramp,offramp}, circles/:id/{contribute,
 		//   payout,vote,auction-bid}, circles/:id/invites,
 		//   governance/proposals/:id/{vote,execute}, token/{stake,unstake},
@@ -170,6 +168,7 @@ func NewRouter(
 			authenticated.GET("/me", authHandler.Me)
 			authenticated.PATCH("/me", userHandler.UpdateProfile)
 			authenticated.PATCH("/users/me", userHandler.UpdateProfile)
+			authenticated.GET("/users/me/subscriptions", subscriptionHandler.ListMine)
 			authenticated.POST("/auth/logout", authHandler.Logout)
 			authenticated.POST("/auth/password/change", authHandler.ChangePassword)
 			authenticated.DELETE("/sessions/:id", authHandler.RevokeSessionByID)
@@ -186,6 +185,9 @@ func NewRouter(
 
 			// Wallet routes
 			authenticated.POST("/wallets", walletHandler.CreateWallet)
+			authenticated.POST("/wallets/hosted-arc/ensure", walletHandler.EnsureHostedArcWallet)
+			authenticated.POST("/wallets/hosted-arc", requireIdem, walletHandler.CreateHostedArcWallet)
+			authenticated.POST("/wallets/link", walletHandler.LinkWallet)
 			authenticated.GET("/wallets", walletHandler.ListWallets)
 			authenticated.GET("/wallets/balance", walletHandler.GetBalance)
 			authenticated.POST("/wallets/withdraw", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), walletHandler.Withdraw)
@@ -200,11 +202,8 @@ func NewRouter(
 			authenticated.POST("/auth/totp/disable", totpLimit, authHandler.DisableTOTP)
 			authenticated.POST("/auth/totp/recovery-codes", totpLimit, authHandler.RegenerateTOTPRecoveryCodes)
 
-			// Deposit / Withdraw routes
-			authenticated.GET("/wallet/deposit/quote", depositHandler.GetDepositQuote)
-			authenticated.POST("/wallet/deposit", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), depositHandler.InitiateDeposit)
-			authenticated.POST("/wallet/withdraw", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), depositHandler.InitiateWithdraw)
-			authenticated.GET("/wallet/transactions/:yellowCardId", depositHandler.GetTransactionStatus)
+			// Fiat ramp routes removed — local-currency deposits are coming
+			// soon. Mobile-money stubs below stay dormant until configured.
 			authenticated.GET("/wallet/mobile-money/providers", mobileMoneyHandler.ListProviders)
 			authenticated.POST("/wallet/mobile-money/onramp", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), mobileMoneyHandler.InitiateOnramp)
 			authenticated.POST("/wallet/mobile-money/offramp", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), mobileMoneyHandler.InitiateOfframp)
@@ -246,6 +245,12 @@ func NewRouter(
 			authenticated.GET("/circles/:id/invites", inviteHandler.ListInvites)
 			authenticated.POST("/circles/:id/invites", requireIdem, inviteHandler.CreateInvite)
 			authenticated.DELETE("/invites/:code", inviteHandler.RevokeInvite)
+
+			// Auto-debit subscriptions (Auto circles only; Flexible stays manual).
+			authenticated.POST("/circles/:id/subscription", requireIdem, subscriptionHandler.Subscribe)
+			authenticated.DELETE("/circles/:id/subscription", subscriptionHandler.Cancel)
+			authenticated.POST("/circles/:id/subscription/pause", subscriptionHandler.Pause)
+			authenticated.POST("/circles/:id/subscription/resume", subscriptionHandler.Resume)
 
 			authenticated.GET("/contributions", contributionHandler.ListContributions)
 			authenticated.GET("/contributions/:id", contributionHandler.GetContribution)

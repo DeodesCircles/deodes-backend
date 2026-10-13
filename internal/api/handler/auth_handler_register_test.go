@@ -171,6 +171,22 @@ func (m *mockWalletService) CreateHostedArcWallet(ctx context.Context, userID st
 	return args.Get(0).(*wallet.Wallet), args.Error(1)
 }
 
+func (m *mockWalletService) LinkWallet(ctx context.Context, userID, address string) (*wallet.Wallet, error) {
+	args := m.Called(ctx, userID, address)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*wallet.Wallet), args.Error(1)
+}
+
+func (m *mockWalletService) GetWalletByAddress(ctx context.Context, address string) (*wallet.Wallet, error) {
+	args := m.Called(ctx, address)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*wallet.Wallet), args.Error(1)
+}
+
 func (m *mockWalletService) SignTransaction(ctx context.Context, walletID string, passkeySeed []byte, txnXDR string) (string, error) {
 	args := m.Called(ctx, walletID, passkeySeed, txnXDR)
 	return args.String(0), args.Error(1)

@@ -91,6 +91,9 @@ func TestResolveCORSAllowedOrigins_BlankEnvFallsBackToDefault(t *testing.T) {
 // assertions below fail on the CORS check rather than on startup validation.
 // The database URL uses sslmode=require because the production environment
 // asserts below would otherwise trip the earlier sslmode check.
+// Mainnet-shaped Arc/Keeper/contracts values are included so the production
+// cases satisfy the mainnet cutover guard (which rejects testnet Arc and
+// contract defaults); they are inert in the development cases.
 func setRequiredEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("MOISTELLO_DATABASE_URL", "postgres://localhost:5432/db?sslmode=require")
@@ -100,6 +103,15 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("ENCRYPTION_KEY", "3132333435363738393031323334353637383930313233343536373839303132")
 	t.Setenv("JWT_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBALs=\n-----END RSA PRIVATE KEY-----")
 	t.Setenv("JWT_PUBLIC_KEY", "-----BEGIN RSA PUBLIC KEY-----\nMFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBALs=\n-----END RSA PUBLIC KEY-----")
+	t.Setenv("DEODES_ARC_RPC_URL", "https://rpc.mainnet.arc.io")
+	t.Setenv("DEODES_ARC_CHAIN_ID", "5042")
+	t.Setenv("DEODES_ARC_USDC_CONTRACT", "0x3600000000000000000000000000000000000000")
+	t.Setenv("DEODES_KEEPER_ESCROW_ADDRESS", "0x1111111111111111111111111111111111111111")
+	t.Setenv("DEODES_CONTRACT_FACTORY", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1")
+	t.Setenv("DEODES_CONTRACT_CIRCLE", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2")
+	t.Setenv("DEODES_CONTRACT_REP_REGISTRY", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA3")
+	t.Setenv("DEODES_CONTRACT_GOV_TOKEN", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4")
+	t.Setenv("DEODES_CONTRACT_TREASURY", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA5")
 }
 
 func TestLoad_CORSOriginsResolvedPerEnvironment(t *testing.T) {

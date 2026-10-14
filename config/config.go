@@ -29,11 +29,13 @@ type Config struct {
 	RateLimit    RateLimitConfig `mapstructure:"rate_limit"`
 	Logging      LoggingConfig
 	Environment  string
-	YellowCard   YellowCardConfig `mapstructure:"yellow_card"`
 	Tracing      TracingConfig
 	Swap         SwapConfig        `mapstructure:"swap"`
 	MobileMoney  MobileMoneyConfig `mapstructure:"mobile_money"`
 	Governance   GovernanceConfig  `mapstructure:"governance"`
+	Arc          ArcConfig         `mapstructure:"arc"`
+	Keeper       KeeperConfig      `mapstructure:"keeper"`
+	Google       GoogleConfig      `mapstructure:"google"`
 
 	// Hot holds the live values of the keys that can be reloaded without a
 	// restart (see HotReloader).
@@ -117,36 +119,6 @@ func (s StellarConfig) String() string {
 	return "{...}"
 }
 
-type YellowCardConfig struct {
-	APIKey               string  `mapstructure:"api_key"`
-	APISecret            string  `mapstructure:"api_secret"`
-	WebhookSecret        string  `mapstructure:"webhook_secret"`
-	MaxDepositNGN        float64 `mapstructure:"max_deposit_ngn"`
-	MaxWithdrawUSDC      float64 `mapstructure:"max_withdraw_usdc"`
-	DailyDepositCapNGN   float64 `mapstructure:"daily_deposit_cap_ngn"`
-	DailyWithdrawCapUSDC float64 `mapstructure:"daily_withdraw_cap_usdc"`
-	// CurrencyCaps holds per-transaction/daily transfer caps for fiat
-	// currencies beyond the legacy NGN fields above (issue #189). NGN
-	// keeps using the fields above for backward compatibility unless an
-	// explicit "NGN" entry is also present here, in which case the entry
-	// takes precedence. A currency with no entry here (and that isn't NGN)
-	// can still be quoted via the pricing endpoint but deposits/withdrawals
-	// for it are rejected, since moving real money in a new corridor
-	// without deliberately configured caps is a business decision, not a
-	// default.
-	CurrencyCaps map[string]CurrencyCaps `mapstructure:"currency_caps"`
-}
-
-// CurrencyCaps are the per-transaction and daily transfer limits for one
-// fiat currency corridor. MaxDeposit/DailyDepositCap are denominated in the
-// fiat currency; MaxWithdraw/DailyWithdrawCap are denominated in USDC.
-type CurrencyCaps struct {
-	MaxDeposit       float64 `mapstructure:"max_deposit"`
-	MaxWithdraw      float64 `mapstructure:"max_withdraw"`
-	DailyDepositCap  float64 `mapstructure:"daily_deposit_cap"`
-	DailyWithdrawCap float64 `mapstructure:"daily_withdraw_cap"`
-}
-
 // MobileMoneyConfig holds credentials for the mobile-money bridge (#190,
 // product-spec.md §7): M-Pesa, MTN Mobile Money, and Airtel Money adapters
 // for non-NGN African markets. Each provider is only registered at startup
@@ -175,6 +147,31 @@ type MobileMoneyConfig struct {
 	AirtelCountry        string `mapstructure:"airtel_country"`
 	AirtelTargetCurrency string `mapstructure:"airtel_target_currency"`
 	AirtelSandbox        bool   `mapstructure:"airtel_sandbox"`
+}
+
+// ArcConfig holds the Arc (EVM) chain settings for hosted wallets and the
+// contribution keeper. USDC (18 decimals) is the native gas token. The USDC
+// contract address has no safe default — look it up at
+// docs.arc.io/arc/references/contract-addresses.md for the target network.
+// Empty USDCContract fails fast at transfer time, never at boot — except in
+// mainnet mode (environment production/mainnet or stellar.network mainnet),
+// where the startup guard (checkMainnetIssues) rejects an empty rpc_url, a
+// testnet rpc_url, an empty usdc_contract, and any chain_id other than 5042.
+type ArcConfig struct {
+	RPCURL       string `mapstructure:"rpc_url"`
+	ChainID      uint64 `mapstructure:"chain_id"`
+	USDCContract string `mapstructure:"usdc_contract"`
+}
+
+// KeeperConfig drives the auto-debit subscription loop. Empty EscrowAddress
+// disables debiting (the loop still runs its tick but debits nothing —
+// fail-closed until an operator collection address is configured).
+// Mainnet guard: an empty escrow is REJECTED when the keeper is enabled
+// (interval_minutes != 0). Set keeper.interval_minutes to 0 to disable the
+// keeper in mainnet mode instead of configuring an escrow address.
+type KeeperConfig struct {
+	EscrowAddress string `mapstructure:"escrow_address"`
+	IntervalMin   int    `mapstructure:"interval_minutes"`
 }
 
 type AuthConfig struct {
@@ -213,6 +210,13 @@ type SecurityConfig struct {
 	Argon2Time    int    `mapstructure:"argon2_time"`
 	Argon2Memory  int    `mapstructure:"argon2_memory"`
 	Argon2Threads int    `mapstructure:"argon2_threads"`
+}
+
+// GoogleConfig holds the OAuth client ID used as the audience check for
+// Google ID tokens on POST /v1/auth/google. Empty disables the endpoint
+// (fail-closed) without blocking boot.
+type GoogleConfig struct {
+	ClientID string `mapstructure:"client_id"`
 }
 
 type BrevoConfig struct {
@@ -370,6 +374,11 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "stellar.network_passphrase", "Test SDF Network ; September 2015")
 	setDefault(v, "stellar.usdc_issuer", "GAX23V3WWDPPR5WRER3KTEUTDLSCGZYMSJY5FDRRKKCIQ4JADF5T27RC")
 	setDefault(v, "stellar.wallet_min_balance", 10.0)
+	setDefault(v, "arc.rpc_url", "")
+	setDefault(v, "arc.chain_id", uint64(5042002))
+	setDefault(v, "arc.usdc_contract", "")
+	setDefault(v, "keeper.escrow_address", "")
+	setDefault(v, "keeper.interval_minutes", 15)
 	setDefault(v, "auth.access_token_ttl", "15m")
 	setDefault(v, "auth.refresh_token_ttl", "168h")
 	setDefault(v, "auth.nonce_ttl", "5m")
@@ -381,6 +390,7 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "security.argon2_memory", 64*1024)
 	setDefault(v, "security.argon2_threads", 4)
 	setDefault(v, "brevo.api_key", "")
+	setDefault(v, "google.client_id", "")
 	setDefault(v, "brevo.from_email", "noreply@moistello.com")
 	setDefault(v, "brevo.from_name", "Moistello")
 	setDefault(v, "indexer.poll_interval", "3s")
@@ -423,9 +433,6 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "notification.sms.auth_token", "")
 	setDefault(v, "notification.sms.from_number", "")
 	setDefault(v, "notification.push.fcm_server_key", "")
-	setDefault(v, "yellow_card.api_key", "")
-	setDefault(v, "yellow_card.api_secret", "")
-	setDefault(v, "yellow_card.webhook_secret", "")
 	setDefault(v, "swap.sweep_interval", "1m")
 	// #414: a passed proposal waits 48h before it can be executed, giving
 	// members time to review it and cancel it. Set to "0" to execute immediately.
@@ -440,6 +447,11 @@ func Load(path string) (*Config, error) {
 	mustBindEnv(v, "database.replica_url", "DEODES_DATABASE_REPLICA_URL", "MOISTELLO_DATABASE_REPLICA_URL", "DATABASE_REPLICA_URL")
 	mustBindEnv(v, "stellar.master_secret_key", "DEODES_STELLAR_MASTER_SECRET_KEY", "MOISTELLO_STELLAR_MASTER_SECRET_KEY", "STELLAR_MASTER_SECRET_KEY")
 	mustBindEnv(v, "stellar.master_public_key", "DEODES_STELLAR_MASTER_PUBLIC_KEY", "MOISTELLO_STELLAR_MASTER_PUBLIC_KEY", "STELLAR_MASTER_PUBLIC_KEY")
+	mustBindEnv(v, "arc.rpc_url", "DEODES_ARC_RPC_URL", "ARC_RPC_URL")
+	mustBindEnv(v, "arc.chain_id", "DEODES_ARC_CHAIN_ID", "ARC_CHAIN_ID")
+	mustBindEnv(v, "arc.usdc_contract", "DEODES_ARC_USDC_CONTRACT", "ARC_USDC_CONTRACT")
+	mustBindEnv(v, "keeper.escrow_address", "DEODES_KEEPER_ESCROW_ADDRESS", "KEEPER_ESCROW_ADDRESS")
+	mustBindEnv(v, "keeper.interval_minutes", "DEODES_KEEPER_INTERVAL_MINUTES", "KEEPER_INTERVAL_MINUTES")
 	mustBindEnv(v, "security.wallet_pepper", "DEODES_SECURITY_WALLET_PEPPER", "MOISTELLO_WALLET_PEPPER")
 	mustBindEnv(v, "security.encryption_key", "DEODES_SECURITY_ENCRYPTION_KEY", "ENCRYPTION_KEY")
 	mustBindEnv(v, "auth.jwt_private_key_pem", "DEODES_AUTH_JWT_PRIVATE_KEY_PEM", "JWT_PRIVATE_KEY")
@@ -449,11 +461,9 @@ func Load(path string) (*Config, error) {
 	mustBindEnv(v, "auth.jwt_previous_public_key_pem", "DEODES_AUTH_JWT_PREVIOUS_PUBLIC_KEY_PEM", "JWT_PREVIOUS_PUBLIC_KEY", "JWT_PREVIOUS_PUBLIC_KEY_PEM")
 	mustBindEnv(v, "auth.jwt_previous_kid", "DEODES_AUTH_JWT_PREVIOUS_KID", "JWT_PREVIOUS_KID")
 	mustBindEnv(v, "brevo.api_key", "DEODES_BREVO_API_KEY", "MOISTELLO_BREVO_API_KEY", "MOISTELLO_NOTIFICATION_EMAIL_APIKEY", "MOISTELLO_EMAIL_API_KEY")
+	mustBindEnv(v, "google.client_id", "DEODES_GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_ID")
 	mustBindEnv(v, "brevo.from_email", "DEODES_BREVO_FROM_EMAIL", "MOISTELLO_BREVO_FROM_EMAIL", "MOISTELLO_NOTIFICATION_EMAIL_FROM_ADDRESS")
 	mustBindEnv(v, "brevo.from_name", "DEODES_BREVO_FROM_NAME", "MOISTELLO_BREVO_FROM_NAME", "MOISTELLO_NOTIFICATION_EMAIL_FROM_NAME")
-	mustBindEnv(v, "yellow_card.api_key", "DEODES_YELLOW_CARD_API_KEY", "YELLOW_CARD_API_KEY")
-	mustBindEnv(v, "yellow_card.api_secret", "DEODES_YELLOW_CARD_API_SECRET", "YELLOW_CARD_API_SECRET")
-	mustBindEnv(v, "yellow_card.webhook_secret", "DEODES_YELLOW_CARD_WEBHOOK_SECRET", "YELLOW_CARD_WEBHOOK_SECRET")
 	mustBindEnv(v, "cors.allowed_origins", "DEODES_CORS_ALLOWED_ORIGINS", "MOISTELLO_CORS_ALLOWED_ORIGINS", "ALLOWED_ORIGINS")
 	mustBindEnv(v, "redis.url", "DEODES_REDIS_URL", "MOISTELLO_REDIS_URL", "REDIS_URL")
 	mustBindEnv(v, "redis.password", "DEODES_REDIS_PASSWORD", "MOISTELLO_REDIS_PASSWORD", "REDIS_PASSWORD")
@@ -492,6 +502,17 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("stellar.governance_token_contract_id", "")
 	mustBindEnv(v, "stellar.governance_token_contract_id", "DEODES_GOVERNANCE_TOKEN_CONTRACT_ID", "MOISTELLO_GOVERNANCE_TOKEN_CONTRACT_ID")
 	v.SetDefault("stellar.escrow_swap_contract_id", "")
+	// Deployed contract IDs: 10-deploy-contracts.sh records them in the
+	// secrets file and 12-backend-env.sh writes them here as MOISTELLO_CONTRACT_*.
+	// Env overrides the git-tracked config.yaml testnet values, so mainnet
+	// cutover never requires editing tracked files. contracts.circle is a
+	// deployed instance ID — NOT the circle WASM hash (CONTRACT_CIRCLE_HASH),
+	// which is a different value with a different home.
+	mustBindEnv(v, "contracts.circle_factory", "DEODES_CONTRACT_FACTORY", "MOISTELLO_CONTRACT_FACTORY")
+	mustBindEnv(v, "contracts.circle", "DEODES_CONTRACT_CIRCLE", "MOISTELLO_CONTRACT_CIRCLE")
+	mustBindEnv(v, "contracts.reputation_registry", "DEODES_CONTRACT_REP_REGISTRY", "MOISTELLO_CONTRACT_REP_REGISTRY")
+	mustBindEnv(v, "contracts.governance_token", "DEODES_CONTRACT_GOV_TOKEN", "MOISTELLO_CONTRACT_GOV_TOKEN")
+	mustBindEnv(v, "contracts.treasury", "DEODES_CONTRACT_TREASURY", "MOISTELLO_CONTRACT_TREASURY")
 	v.SetDefault("auth.access_token_ttl", "15m")
 	v.SetDefault("auth.refresh_token_ttl", "168h")
 	v.SetDefault("auth.nonce_ttl", "5m")
@@ -728,6 +749,18 @@ func validateDuration(name string, ok bool) {
 	}
 }
 
+// isMainnetEnvironment reports whether the operator intends mainnet mode via
+// the environment name rather than stellar.network. Matching is
+// case-insensitive and trims surrounding whitespace.
+func isMainnetEnvironment(env string) bool {
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "production", "mainnet":
+		return true
+	default:
+		return false
+	}
+}
+
 func checkMainnetIssues(cfg *Config) []string {
 	const (
 		testnetNetwork    = "testnet"
@@ -735,10 +768,31 @@ func checkMainnetIssues(cfg *Config) []string {
 		testnetSorobanRPC = "https://soroban-testnet.stellar.org"
 		testnetPassphrase = "Test SDF Network ; September 2015"
 		testnetUSDCIssuer = "GAX23V3WWDPPR5WRER3KTEUTDLSCGZYMSJY5FDRRKKCIQ4JADF5T27RC"
+		// Arc mainnet chain ID (docs.arc.io/arc/references/connect-to-arc).
+		// The config default chain_id 5042002 is the Arc testnet. Kept as a
+		// literal (not pkg/arc.ChainIDMainnet) so config stays dependency-free.
+		arcMainnetChainID = uint64(5042)
 	)
 
-	if cfg.Stellar.Network == "mainnet" {
-		issues := []string{}
+	// Known testnet contract IDs (config/config.yaml "contracts" block). Any
+	// of these still configured in mainnet mode means cutover is incomplete.
+	// Mainnet IDs also start with "C", so only these exact values are flagged.
+	testnetContractIDs := map[string]bool{
+		"CADZWDGER6PYEWVHZDZ5HMEV6A5TKFVD4EY4DSPUTEKAM2KDPEABGJQU": true,
+		"CALNXOUPT267LRRUCIF6OICEVGVEVKH2D2SX3YURCB4JXLDOF5TXVPCN": true,
+		"CCEEJKQCYO7CXBFZBSGHS6AK2CCBU2HY2HK4VXQDPZ3XX3X3KEDGXQ7K": true,
+		"CDOBQSJZJD4RIE2V5Q2IOJ6PBPSE2FT46BCD5WXW64ZN4KEUMYGBX3CS": true,
+		"CASXVLHWI56BBKLZHDHCFMCXDWJ4XWEMZABVBUIQBPDHVK4UW6ICUSFI": true,
+	}
+
+	stellarMainnet := cfg.Stellar.Network == "mainnet"
+	envMainnet := isMainnetEnvironment(cfg.Environment)
+	if !stellarMainnet && !envMainnet {
+		return nil
+	}
+
+	issues := []string{}
+	if stellarMainnet {
 		if cfg.Stellar.Network == testnetNetwork {
 			issues = append(issues, "network still set to testnet")
 		}
@@ -754,9 +808,43 @@ func checkMainnetIssues(cfg *Config) []string {
 		if cfg.Stellar.USDCIssuer == testnetUSDCIssuer {
 			issues = append(issues, "usdc_issuer still set to testnet")
 		}
-		return issues
 	}
-	return nil
+
+	// Arc is the primary chain: a mainnet process must point at Arc mainnet
+	// (chain 5042) with an explicit RPC endpoint and USDC contract. The
+	// defaults are testnet-shaped (chain 5042002, empty rpc/usdc), so an
+	// unconfigured mainnet deploy fails here instead of signing on the
+	// wrong chain.
+	if cfg.Arc.ChainID != arcMainnetChainID {
+		issues = append(issues, fmt.Sprintf("arc.chain_id must be %d for mainnet (got %d; set DEODES_ARC_CHAIN_ID)", arcMainnetChainID, cfg.Arc.ChainID))
+	}
+	if strings.TrimSpace(cfg.Arc.RPCURL) == "" {
+		issues = append(issues, "arc.rpc_url must be set for mainnet mode (set DEODES_ARC_RPC_URL)")
+	} else if strings.Contains(strings.ToLower(cfg.Arc.RPCURL), "testnet") {
+		issues = append(issues, fmt.Sprintf("arc.rpc_url still points to testnet (%q)", cfg.Arc.RPCURL))
+	}
+	if strings.TrimSpace(cfg.Arc.USDCContract) == "" {
+		issues = append(issues, "arc.usdc_contract must be set for mainnet mode (set DEODES_ARC_USDC_CONTRACT; see docs.arc.io/arc/references/contract-addresses.md)")
+	}
+
+	// Keeper: an empty escrow disables debiting, which is safe in development
+	// but a silent misconfiguration in mainnet while the loop is enabled.
+	// Reject ONLY when the keeper is enabled (interval_minutes != 0); an
+	// operator that wants no auto-debits sets keeper.interval_minutes to 0.
+	if strings.TrimSpace(cfg.Keeper.EscrowAddress) == "" && cfg.Keeper.IntervalMin != 0 {
+		issues = append(issues, "keeper.escrow_address must be set when keeper.interval_minutes is non-zero in mainnet mode (set DEODES_KEEPER_ESCROW_ADDRESS, or set interval to 0 to disable the keeper)")
+	}
+
+	for name, id := range cfg.Contracts {
+		if testnetContractIDs[strings.TrimSpace(id)] {
+			issues = append(issues, fmt.Sprintf("contracts.%s still set to testnet value", name))
+		}
+	}
+
+	if len(issues) == 0 {
+		return nil
+	}
+	return issues
 }
 
 func validateMainnetConfig(cfg *Config) {
@@ -780,7 +868,6 @@ func (c *Config) ValidateSecrets() error {
 		{"Stellar.MasterSecretKey", c.Stellar.MasterSecretKey},
 		{"Redis.Password", c.Redis.Password},
 		{"Database.URL", c.Database.URL}, // credentials live in the DSN; there is no separate password field
-		{"YellowCard.WebhookSecret", c.YellowCard.WebhookSecret},
 	}
 
 	var missing []string
@@ -811,9 +898,6 @@ func (c *Config) ValidateSecrets() error {
 		if err := validateHexKeyFormat("Auth.AdminAPIKeySecondary", c.Auth.AdminAPIKeySecondary); err != nil {
 			return err
 		}
-	}
-	if err := validateHexKeyFormat("YellowCard.WebhookSecret", c.YellowCard.WebhookSecret); err != nil {
-		return err
 	}
 
 	// Validate JWT keys are PEM format

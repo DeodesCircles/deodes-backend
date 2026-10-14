@@ -2,6 +2,7 @@ package payout
 
 import (
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,6 +25,11 @@ const (
 	VerificationStatusVerified   VerificationStatus = "verified"
 	VerificationStatusFailed     VerificationStatus = "failed"
 )
+
+// ErrRoundAlreadyPaid is returned when a payout already exists for the
+// circle/round. A ROSCA round distributes exactly once, so a second trigger
+// for the same round is a conflict — never a second payout.
+var ErrRoundAlreadyPaid = errors.New("payout already recorded for this circle round")
 
 type Payout struct {
 	ID                 uuid.UUID          `json:"id" db:"id"`

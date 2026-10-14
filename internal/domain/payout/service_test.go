@@ -29,7 +29,7 @@ func TestPayoutService_Record_Success(t *testing.T) {
 	}
 
 	repo.On("FindByTxnHash", ctx, "txn-payout-123").Return(nil, apperrors.ErrNotFound)
-	repo.On("ListByCircle", ctx, mock.AnythingOfType("uuid.UUID"), 1, 100).Return([]payout.Payout{}, 0, nil)
+	repo.On("FindByCircleAndRound", ctx, mock.AnythingOfType("uuid.UUID"), 1).Return(nil, apperrors.ErrNotFound)
 
 	repo.On("Create", ctx, mock.MatchedBy(func(p *payout.Payout) bool {
 		return p.Amount == 500.0 &&
@@ -69,7 +69,7 @@ func TestPayoutService_Record_VerifiedOnchain(t *testing.T) {
 	}
 
 	repo.On("FindByTxnHash", ctx, "txn-payout-456").Return(nil, apperrors.ErrNotFound)
-	repo.On("ListByCircle", ctx, mock.AnythingOfType("uuid.UUID"), 1, 100).Return([]payout.Payout{}, 0, nil)
+	repo.On("FindByCircleAndRound", ctx, mock.AnythingOfType("uuid.UUID"), 1).Return(nil, apperrors.ErrNotFound)
 
 	repo.On("Create", ctx, mock.MatchedBy(func(p *payout.Payout) bool {
 		return p.VerifiedOnchain == true && p.VerificationStatus == payout.VerificationStatusVerified
@@ -131,4 +131,101 @@ func TestPayoutService_GetCircleHistory(t *testing.T) {
 	assert.Len(t, res, 1)
 	assert.Equal(t, 1, total)
 	repo.AssertExpectations(t)
+}
+
+func TestPayoutService_Record_RejectsSecondPayoutForSameRound(t *testing.T) {
+	repo := new(payoutMocks.Repository)
+	svc := payout.NewService(repo, nil, nil, nil)
+	ctx := context.Background()
+
+	circleID := uuid.New()
+	firstRecipient := uuid.New()
+	existing := &payout.Payout{
+		ID: uuid.New(), CircleID: circleID, RecipientID: firstRecipient,
+		RoundNumber: 1, Amount: 500.0,
+	}
+
+	// A different recipient attempts a second distribution for round 1 with a
+	// fresh on-chain hash: the round — not the txn — is already paid.
+	input := payout.RecordInput{
+		CircleID:    circleID.String(),
+		RecipientID: uuid.New().String(),
+		RoundNumber: 1,
+		Amount:      500.0,
+		FeeAmount:   2.5,
+		TxnHash:     "second-txn-same-round",
+		PayoutType:  payout.PayoutTypeFixed,
+	}
+
+	repo.On("FindByTxnHash", ctx, "second-txn-same-round").Return(nil, apperrors.ErrNotFound)
+	repo.On("FindByCircleAndRound", ctx, circleID, 1).Return(existing, nil)
+
+	got, err := svc.Record(ctx, input)
+
+	assert.ErrorIs(t, err, payout.ErrRoundAlreadyPaid)
+	assert.Equal(t, existing.ID, got.ID, "must return the already-recorded round payout")
+	repo.AssertNotCalled(t, "Create", mock.Anything, mock.Anything)
+	repo.AssertExpectations(t)
+}
+
+func TestPayoutService_Record_RejectsInvalidAmounts(t *testing.T) {
+	ctx := context.Background()
+
+	cases := []struct {
+		name  string
+		input payout.RecordInput
+	}{
+		{"zero round", payout.RecordInput{CircleID: uuid.New().String(), RecipientID: uuid.New().String(), RoundNumber: 0, Amount: 100, TxnHash: "h", PayoutType: payout.PayoutTypeFixed}},
+		{"zero amount", payout.RecordInput{CircleID: uuid.New().String(), RecipientID: uuid.New().String(), RoundNumber: 1, Amount: 0, TxnHash: "h", PayoutType: payout.PayoutTypeFixed}},
+		{"negative amount", payout.RecordInput{CircleID: uuid.New().String(), RecipientID: uuid.New().String(), RoundNumber: 1, Amount: -5, TxnHash: "h", PayoutType: payout.PayoutTypeFixed}},
+		{"negative fee", payout.RecordInput{CircleID: uuid.New().String(), RecipientID: uuid.New().String(), RoundNumber: 1, Amount: 100, FeeAmount: -1, TxnHash: "h", PayoutType: payout.PayoutTypeFixed}},
+		{"fee exceeds amount", payout.RecordInput{CircleID: uuid.New().String(), RecipientID: uuid.New().String(), RoundNumber: 1, Amount: 100, FeeAmount: 101, TxnHash: "h", PayoutType: payout.PayoutTypeFixed}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := new(payoutMocks.Repository)
+			svc := payout.NewService(repo, nil, nil, nil)
+			got, err := svc.Record(ctx, tc.input)
+			assert.Error(t, err)
+			assert.Nil(t, got)
+			repo.AssertNotCalled(t, "Create", mock.Anything, mock.Anything)
+		})
+	}
+}
+
+func TestPayoutService_GetRoundPayout(t *testing.T) {
+	ctx := context.Background()
+	circleID := uuid.New()
+
+	t.Run("returns existing round payout", func(t *testing.T) {
+		repo := new(payoutMocks.Repository)
+		svc := payout.NewService(repo, nil, nil, nil)
+		existing := &payout.Payout{ID: uuid.New(), CircleID: circleID, RoundNumber: 2}
+		repo.On("FindByCircleAndRound", ctx, circleID, 2).Return(existing, nil)
+
+		got, err := svc.GetRoundPayout(ctx, circleID.String(), 2)
+		assert.NoError(t, err)
+		assert.Equal(t, existing.ID, got.ID)
+		repo.AssertExpectations(t)
+	})
+
+	t.Run("returns nil when round is unpaid", func(t *testing.T) {
+		repo := new(payoutMocks.Repository)
+		svc := payout.NewService(repo, nil, nil, nil)
+		repo.On("FindByCircleAndRound", ctx, circleID, 3).Return(nil, apperrors.ErrNotFound)
+
+		got, err := svc.GetRoundPayout(ctx, circleID.String(), 3)
+		assert.NoError(t, err)
+		assert.Nil(t, got)
+		repo.AssertExpectations(t)
+	})
+
+	t.Run("rejects invalid circle id", func(t *testing.T) {
+		repo := new(payoutMocks.Repository)
+		svc := payout.NewService(repo, nil, nil, nil)
+		got, err := svc.GetRoundPayout(ctx, "not-a-uuid", 1)
+		assert.Error(t, err)
+		assert.Nil(t, got)
+	})
 }

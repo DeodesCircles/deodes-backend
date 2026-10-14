@@ -15,14 +15,17 @@ import (
 )
 
 // RecordInput carries all fields needed to record a payout.
+// Validation tags mirror the TriggerPayout request contract: the handler
+// binds the JSON body directly into this struct and validates it before the
+// circle ID from the URL path is applied.
 type RecordInput struct {
-	CircleID    string
-	RecipientID string
-	RoundNumber int
-	Amount      float64
-	FeeAmount   float64
-	TxnHash     string
-	PayoutType  PayoutType
+	CircleID    string     `json:"-" validate:"required,uuid"`
+	RecipientID string     `json:"recipientId" validate:"required,uuid"`
+	RoundNumber int        `json:"roundNumber" validate:"required,gte=1"`
+	Amount      float64    `json:"amount" validate:"required,gt=0"`
+	FeeAmount   float64    `json:"feeAmount" validate:"gte=0"`
+	TxnHash     string     `json:"txnHash" validate:"required"`
+	PayoutType  PayoutType `json:"payoutType" validate:"required,oneof=random fixed auction vote"`
 	// Optional overrides — used by the indexer / tests to set verification
 	// state directly without going through the Horizon check.
 	VerifiedOnchain    *bool
@@ -51,6 +54,9 @@ type Service interface {
 	Record(ctx context.Context, input RecordInput) (*Payout, error)
 	GetUserHistory(ctx context.Context, userID string, page, limit int) ([]Payout, int, error)
 	GetCircleHistory(ctx context.Context, circleID string, page, limit int) ([]Payout, int, error)
+	// GetRoundPayout returns the payout recorded for a circle round, or nil
+	// when the round has not been distributed yet.
+	GetRoundPayout(ctx context.Context, circleID string, round int) (*Payout, error)
 	UpdateVerification(ctx context.Context, id string, verifiedOnchain bool, status VerificationStatus) error
 }
 
@@ -105,6 +111,22 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Payout, error
 	recipientUID, err := uuid.Parse(input.RecipientID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid recipientID: %w", err)
+	}
+
+	// Defensive validation for callers that bypass the HTTP handler
+	// (indexer replay, keeper jobs). The handler enforces the same rules
+	// via validator tags on RecordInput.
+	if input.RoundNumber < 1 {
+		return nil, fmt.Errorf("invalid round number %d: must be at least 1", input.RoundNumber)
+	}
+	if input.Amount <= 0 {
+		return nil, fmt.Errorf("invalid payout amount %v: must be greater than zero", input.Amount)
+	}
+	if input.FeeAmount < 0 {
+		return nil, fmt.Errorf("invalid fee amount %v: must not be negative", input.FeeAmount)
+	}
+	if input.FeeAmount > input.Amount {
+		return nil, fmt.Errorf("invalid fee amount %v: exceeds payout amount %v", input.FeeAmount, input.Amount)
 	}
 
 	// Idempotency: return existing record if this txnHash was already processed.
@@ -180,16 +202,16 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Payout, error
 		}
 	}
 
-	// Guard against duplicate payouts in the same circle/round/recipient
-	// (belt-and-suspenders alongside the DB UNIQUE index on txn_hash).
-	existingPayouts, _, _ := s.repo.ListByCircle(ctx, circleUID, 1, 100)
-	for _, p := range existingPayouts {
-		if p.RecipientID == recipientUID && p.RoundNumber == input.RoundNumber {
-			log.Warn().Str("circle_id", input.CircleID).
-				Int("round", input.RoundNumber).
-				Msg("payout already exists for this circle/round/recipient")
-			return &p, nil
-		}
+	// Guard against duplicate payouts in the same circle/round. A ROSCA round
+	// distributes exactly once, regardless of recipient: a second trigger for
+	// an already-paid round is a conflict. The lookup is by (circle, round)
+	// directly, so — unlike the previous bounded ListByCircle scan — it cannot
+	// miss rows past a page limit.
+	if existing, err := s.repo.FindByCircleAndRound(ctx, circleUID, input.RoundNumber); err == nil && existing != nil {
+		log.Warn().Str("circle_id", input.CircleID).
+			Int("round", input.RoundNumber).
+			Msg("payout already exists for this circle round")
+		return existing, ErrRoundAlreadyPaid
 	}
 
 	p := &Payout{
@@ -247,6 +269,23 @@ func (s *service) GetCircleHistory(ctx context.Context, circleID string, page, l
 		return nil, 0, fmt.Errorf("invalid circleID: %w", err)
 	}
 	return s.repo.ListByCircle(ctx, cid, page, limit)
+}
+
+// GetRoundPayout returns the payout recorded for a circle round, or nil when
+// the round has not been distributed yet.
+func (s *service) GetRoundPayout(ctx context.Context, circleID string, round int) (*Payout, error) {
+	cid, err := uuid.Parse(circleID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid circleID: %w", err)
+	}
+	existing, err := s.repo.FindByCircleAndRound(ctx, cid, round)
+	if err != nil {
+		if err == apperrors.ErrNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return existing, nil
 }
 
 func (s *service) UpdateVerification(ctx context.Context, id string, verifiedOnchain bool, status VerificationStatus) error {

@@ -18,6 +18,7 @@ import (
 	"github.com/deodes/backend/internal/domain/invite"
 	"github.com/deodes/backend/internal/domain/payout"
 	"github.com/deodes/backend/pkg/apperrors"
+	"github.com/deodes/backend/pkg/money"
 	"github.com/deodes/backend/pkg/pagination"
 	"github.com/deodes/backend/pkg/response"
 	"github.com/deodes/backend/pkg/validator"
@@ -283,8 +284,16 @@ type PayoutPreviewResponse struct {
 	TotalNetAmount     float64                 `json:"totalNetAmount"`
 	ProtocolFee        float64                 `json:"protocolFee"`
 	StellarFeeEstimate float64                 `json:"stellarFeeEstimate"`
-	Recipients         []RecipientDistribution `json:"recipients"`
-	DryRun             bool                    `json:"dryRun"`
+	// ArcFeeEstimate is the estimated Arc network fee in USDC (USDC is gas,
+	// 18 decimals, 20 Gwei floor). Kept alongside StellarFeeEstimate for
+	// backward compatibility during the Stellar -> Arc migration.
+	ArcFeeEstimate float64 `json:"arcFeeEstimate"`
+	Recipients     []RecipientDistribution `json:"recipients"`
+	DryRun         bool                    `json:"dryRun"`
+	// IsDue reports whether the previewed round is currently distributable:
+	// the round has started (round <= current round) and no payout has been
+	// recorded for it yet.
+	IsDue bool `json:"isDue"`
 }
 
 func (h *CircleHandler) buildPayoutPreview(cir *circle.Circle, reqAmount *float64, reqFee *float64, recipientID string, roundNumber int) PayoutPreviewResponse {
@@ -314,13 +323,15 @@ func (h *CircleHandler) buildPayoutPreview(cir *circle.Circle, reqAmount *float6
 		}
 		gross = cir.ContributionAmount * float64(members)
 	}
+	// Two-decimal money rounding so gross/fee/net stay consistent in USDC.
+	gross = math.Round(gross*100) / 100
 
 	protocolFee := 0.0
 	if reqFee != nil && *reqFee >= 0 {
 		protocolFee = *reqFee
 	} else {
-		// 1% default protocol fee
-		protocolFee = math.Round(gross*0.01*100) / 100
+		// 0.5% default protocol fee on payouts only (spec + transparency page).
+		protocolFee = math.Round(gross*0.005*100) / 100
 	}
 
 	net := gross - protocolFee
@@ -330,6 +341,8 @@ func (h *CircleHandler) buildPayoutPreview(cir *circle.Circle, reqAmount *float6
 
 	// 100 stroops (0.00001 XLM) base fee per Stellar payment operation
 	stellarFeeEstimate := 0.00001
+	// Arc network fee estimate in USDC (USDC is gas, ~$0.001 per tx).
+	arcFeeEstimate := 0.001
 
 	return PayoutPreviewResponse{
 		CircleID:           cir.ID.String(),
@@ -339,6 +352,7 @@ func (h *CircleHandler) buildPayoutPreview(cir *circle.Circle, reqAmount *float6
 		TotalNetAmount:     net,
 		ProtocolFee:        protocolFee,
 		StellarFeeEstimate: stellarFeeEstimate,
+		ArcFeeEstimate:     arcFeeEstimate,
 		Recipients: []RecipientDistribution{
 			{
 				RecipientID: recipient,
@@ -389,7 +403,38 @@ func (h *CircleHandler) PreviewPayout(c *gin.Context) {
 	}
 	_ = c.ShouldBindJSON(&req)
 
+	if req.Amount != nil && *req.Amount <= 0 {
+		response.BadRequest(c, "preview amount must be greater than zero")
+		return
+	}
+	if req.FeeAmount != nil && *req.FeeAmount < 0 {
+		response.BadRequest(c, "preview fee amount must not be negative")
+		return
+	}
+	if req.Amount != nil && req.FeeAmount != nil && *req.FeeAmount > *req.Amount {
+		response.BadRequest(c, "preview fee amount must not exceed the payout amount")
+		return
+	}
+	if req.RecipientID != "" {
+		member, err := h.circleService.IsMember(c.Request.Context(), circleID, req.RecipientID)
+		if err != nil {
+			response.InternalError(c, "failed to verify recipient membership")
+			return
+		}
+		if !member {
+			response.BadRequest(c, "recipient is not a member of this circle")
+			return
+		}
+	}
+
 	preview := h.buildPayoutPreview(cir, req.Amount, req.FeeAmount, req.RecipientID, req.RoundNumber)
+	// A round is due when it has started and has not been paid out yet.
+	preview.IsDue = preview.RoundNumber >= 1 && preview.RoundNumber <= cir.CurrentRound
+	if preview.IsDue {
+		if existing, err := h.payoutService.GetRoundPayout(c.Request.Context(), circleID, preview.RoundNumber); err == nil && existing != nil {
+			preview.IsDue = false
+		}
+	}
 	response.OK(c, gin.H{"preview": preview})
 }
 
@@ -431,13 +476,69 @@ func (h *CircleHandler) TriggerPayout(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
+	req.CircleID = circleID
+	// Default the payout type to the circle's so clients that only send
+	// recipient/amount/txnHash keep working across payout modes.
+	if req.PayoutType == "" {
+		req.PayoutType = payout.PayoutType(cir.PayoutType)
+	}
+	// An omitted round targets the current (due) round.
+	if req.RoundNumber < 1 {
+		req.RoundNumber = cir.CurrentRound
+		if req.RoundNumber < 1 {
+			req.RoundNumber = 1
+		}
+	}
+	// Round-due check: only the current round or a past unpaid round can be
+	// distributed. Future rounds are never due.
+	if req.RoundNumber > cir.CurrentRound {
+		response.BadRequest(c, fmt.Sprintf("round %d is not due yet: circle is on round %d", req.RoundNumber, cir.CurrentRound))
+		return
+	}
 	if err := validator.Validate.Struct(req); err != nil {
 		response.ValidationErrors(c, "validation failed: "+err.Error())
 		return
 	}
-	req.CircleID = circleID
+	// Arc USDC only: the distribution receipt is always an Arc EVM
+	// transaction hash. Wrong-rail hashes fail fast with a 422 instead of
+	// being recorded as perpetually-pending (same rule as Contribute).
+	if !isArcTxHash(req.TxnHash) {
+		response.ValidationErrors(c, "txnHash must be an Arc EVM transaction hash (0x followed by 64 hex characters)")
+		return
+	}
+	// The recipient must be a circle member — an organizer cannot distribute
+	// the pool to an arbitrary address.
+	member, err := h.circleService.IsMember(c.Request.Context(), circleID, req.RecipientID)
+	if err != nil {
+		response.InternalError(c, "failed to verify recipient membership")
+		return
+	}
+	if !member {
+		response.Forbidden(c, "recipient is not a member of this circle")
+		return
+	}
+	// Double-payout guard: a round distributes exactly once. A replay for the
+	// same recipient is idempotent (200 + existing record); a different
+	// recipient for an already-paid round is a conflict (409).
+	existing, err := h.payoutService.GetRoundPayout(c.Request.Context(), circleID, req.RoundNumber)
+	if err != nil {
+		response.InternalError(c, "failed to verify round payout state")
+		return
+	}
+	if existing != nil {
+		if existing.RecipientID.String() == req.RecipientID {
+			response.OK(c, gin.H{"payout": existing, "status": cir.Status, "duplicate": true})
+			return
+		}
+		response.Conflict(c, "payout already recorded for this circle round")
+		return
+	}
 	record, err := h.payoutService.Record(c.Request.Context(), req)
 	if err != nil {
+		if errors.Is(err, payout.ErrRoundAlreadyPaid) {
+			response.Conflict(c, err.Error())
+			return
+		}
 		response.InternalError(c, "failed to record payout: "+err.Error())
 		return
 	}
@@ -501,10 +602,28 @@ func (h *CircleHandler) JoinCircle(c *gin.Context) {
 func (h *CircleHandler) Contribute(c *gin.Context) {
 	circleID := c.Param("id")
 	userID := middleware.GetUserID(c)
+	// Auth: the route is behind AuthMiddleware, but a missing userID must be
+	// a 401 rather than a 500 from the service's UUID parse. Never trust a
+	// client-supplied walletAddress/userID — identity always comes from the
+	// bearer session. CSRF + Idempotency-Key are enforced by middleware
+	// (see router.go: requireIdem + CSRFTokenValidator); this handler performs
+	// no state change without them.
+	if userID == "" {
+		response.Unauthorized(c, "authentication required")
+		return
+	}
+	if _, err := uuid.Parse(circleID); err != nil {
+		response.BadRequest(c, "invalid circle ID")
+		return
+	}
+	if _, err := uuid.Parse(userID); err != nil {
+		response.Unauthorized(c, "invalid session identity")
+		return
+	}
 	var req struct {
-		Amount      float64 `json:"amount" validate:"required,gt=0"`
+		Amount      float64 `json:"amount" validate:"required,gt=0,lte=10000000"`
 		TxnHash     string  `json:"txnHash" validate:"required"`
-		RoundNumber int     `json:"roundNumber" validate:"required,gte=1"`
+		RoundNumber int     `json:"roundNumber" validate:"required,gte=1,lte=10000"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, err.Error())
@@ -514,21 +633,41 @@ func (h *CircleHandler) Contribute(c *gin.Context) {
 		response.ValidationErrors(c, "validation failed: "+err.Error())
 		return
 	}
+	// Arc USDC only: the EVM tx hash is always 0x + 64 hex. Stellar-style
+	// hashes are rejected here so a wrong-rail submission fails fast with a
+	// 422 instead of being recorded as perpetually-pending.
+	if !isArcTxHash(req.TxnHash) {
+		response.ValidationErrors(c, "txnHash must be an Arc EVM transaction hash (0x followed by 64 hex characters)")
+		return
+	}
+	// money.FromFloat64 rejects NaN/Inf and overflow without panicking
+	// (Must* is forbidden in request paths).
+	if _, err := money.FromFloat64(req.Amount); err != nil {
+		response.BadRequest(c, "invalid contribution amount: "+err.Error())
+		return
+	}
 
 	cir, err := h.circleService.Get(c.Request.Context(), circleID)
 	if err != nil {
 		response.NotFound(c, "circle not found")
 		return
 	}
-	if cir.CircleType == circle.CircleTypePremium {
-		if cir.Currency == circle.CurrencyUSDC && req.Amount < 50 {
-			response.BadRequest(c, "premium circles require minimum 50 USDC contribution")
-			return
-		}
-		if cir.Currency == circle.CurrencyXLM && req.Amount < 100 {
-			response.BadRequest(c, "premium circles require minimum 100 XLM contribution")
-			return
-		}
+	// Arc product rail is USDC-only. Legacy XLM circles cannot receive
+	// EVM contributions.
+	if cir.Currency != circle.CurrencyUSDC {
+		response.BadRequest(c, "only USDC contributions are supported on Arc")
+		return
+	}
+	if cir.CircleType == circle.CircleTypePremium && req.Amount < 50 {
+		response.BadRequest(c, "premium circles require minimum 50 USDC contribution")
+		return
+	}
+	// The round payment must equal the circle's configured amount (within a
+	// stroop of tolerance for float transport). Under/over-payments are a
+	// 422 so the member can retry with the exact figure.
+	if math.Abs(req.Amount-cir.ContributionAmount) > 0.0000001 {
+		response.ValidationErrors(c, fmt.Sprintf("amount must equal the circle contribution amount of %v USDC", cir.ContributionAmount))
+		return
 	}
 
 	contrib, err := h.contribService.Record(c.Request.Context(), contribution.RecordInput{
@@ -539,11 +678,46 @@ func (h *CircleHandler) Contribute(c *gin.Context) {
 		TxnHash:     req.TxnHash,
 	})
 	if err != nil {
-		response.InternalError(c, "failed to record contribution: "+err.Error())
+		mapContributeError(c, err)
 		return
 	}
 
 	response.Created(c, gin.H{"success": true, "contribution": contrib})
+}
+
+// isArcTxHash reports whether s is an EVM transaction hash (0x + 64 hex).
+func isArcTxHash(s string) bool {
+	if len(s) != 66 || len(s) < 2 || s[0] != '0' || s[1] != 'x' && s[1] != 'X' {
+		return false
+	}
+	for _, r := range s[2:] {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// mapContributeError translates domain/service errors into the correct HTTP
+// status instead of collapsing everything into a 500.
+func mapContributeError(c *gin.Context, err error) {
+	msg := err.Error()
+	switch {
+	case errors.Is(err, apperrors.ErrCircleEnded):
+		response.ErrorWithCode(c, http.StatusUnprocessableEntity, "CIRCLE_ENDED", msg)
+	case errors.Is(err, apperrors.ErrLateContributionRejected):
+		response.ErrorWithCode(c, http.StatusUnprocessableEntity, "LATE_CONTRIBUTION", msg)
+	case strings.Contains(msg, "user is not a member"):
+		response.Forbidden(c, msg)
+	case strings.Contains(msg, "on-chain verification failed"):
+		response.ErrorWithCode(c, http.StatusUnprocessableEntity, "ONCHAIN_VERIFICATION_FAILED", msg)
+	case strings.Contains(msg, "invalid circleID") || strings.Contains(msg, "invalid userID") || strings.Contains(msg, "invalid contribution amount"):
+		response.BadRequest(c, msg)
+	case strings.Contains(msg, "getting circle"):
+		response.NotFound(c, "circle not found")
+	default:
+		response.InternalError(c, "failed to record contribution: "+msg)
+	}
 }
 
 func (h *CircleHandler) ExitCircle(c *gin.Context) {

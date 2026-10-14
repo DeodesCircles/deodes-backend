@@ -109,7 +109,7 @@ func TestCircleLifecycle(t *testing.T) {
 	t.Run("Step5_RecordPayout", func(t *testing.T) {
 		circleID := uuid.New()
 		payoutRepo.On("FindByTxnHash", mock.Anything, "txn-payout-001").Return(nil, nil).Once()
-		payoutRepo.On("ListByCircle", mock.Anything, circleID, 1, 100).Return([]payout.Payout{}, 0, nil).Once()
+		payoutRepo.On("FindByCircleAndRound", mock.Anything, circleID, 1).Return(nil, nil).Once()
 		payoutRepo.On("Create", mock.Anything, mock.AnythingOfType("*payout.Payout")).Return(nil).Once()
 
 		p, err := payoutSvc.Record(nil, payout.RecordInput{

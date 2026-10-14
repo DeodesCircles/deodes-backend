@@ -94,7 +94,8 @@ func TestIntegration_Payout_VerificationStatusFlow(t *testing.T) {
 	circleID := circleUUID.String()
 	recipientID := uuid.New().String()
 
-	repo.On("ListByCircle", ctx, circleUUID, 1, 100).Return([]payout.Payout{}, 0, nil)
+	repo.On("FindByCircleAndRound", ctx, circleUUID, 1).Return(nil, apperrors.ErrNotFound)
+	repo.On("FindByCircleAndRound", ctx, circleUUID, 2).Return(nil, apperrors.ErrNotFound)
 
 	t.Run("client-supplied payout defaults to unverified", func(t *testing.T) {
 		input := payout.RecordInput{

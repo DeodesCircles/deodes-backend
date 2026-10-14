@@ -57,8 +57,8 @@ func TestPayoutService_Record_VerifiesOnChain_Success(t *testing.T) {
 
 	// No prior record.
 	repo.On("FindByTxnHash", ctx, "valid-payout-txn").Return(nil, apperrors.ErrNotFound)
-	// No duplicate in same circle/round.
-	repo.On("ListByCircle", ctx, mock.AnythingOfType("uuid.UUID"), 1, 100).Return([]payout.Payout{}, 0, nil)
+	// No payout recorded for this circle/round yet.
+	repo.On("FindByCircleAndRound", ctx, mock.AnythingOfType("uuid.UUID"), 1).Return(nil, apperrors.ErrNotFound)
 	// Wallet lookup succeeds.
 	wallets.On("WalletAddressForUser", ctx, recipientID).Return(recipientWallet, nil)
 	// Horizon confirms payment to recipient for the amount.
@@ -107,7 +107,7 @@ func TestPayoutService_Record_RejectsWrongRecipient(t *testing.T) {
 	}
 
 	repo.On("FindByTxnHash", ctx, "wrong-recipient-txn").Return(nil, apperrors.ErrNotFound)
-	// ListByCircle is called for duplicate-round check after verification passes,
+	// FindByCircleAndRound is called for the duplicate-round check after verification passes,
 	// but here verification rejects first — so we don't expect it.
 	wallets.On("WalletAddressForUser", ctx, recipientID).Return(legitWallet, nil)
 	// Horizon says the payment went to a DIFFERENT address — mismatch.
@@ -189,7 +189,7 @@ func TestPayoutService_Record_PendingWhenHorizonUnavailable(t *testing.T) {
 	}
 
 	repo.On("FindByTxnHash", ctx, "horizon-down-txn").Return(nil, apperrors.ErrNotFound)
-	repo.On("ListByCircle", ctx, mock.AnythingOfType("uuid.UUID"), 1, 100).Return([]payout.Payout{}, 0, nil)
+	repo.On("FindByCircleAndRound", ctx, mock.AnythingOfType("uuid.UUID"), 1).Return(nil, apperrors.ErrNotFound)
 	wallets.On("WalletAddressForUser", ctx, recipientID).Return("GWALLET...", nil)
 	// Horizon is down.
 	horizon.On("VerifyPayment", ctx, "horizon-down-txn", "GWALLET...", "300.0000000").
@@ -234,7 +234,7 @@ func TestPayoutService_Record_PendingWhenWalletLookupFails(t *testing.T) {
 	}
 
 	repo.On("FindByTxnHash", ctx, "wallet-lookup-fail-txn").Return(nil, apperrors.ErrNotFound)
-	repo.On("ListByCircle", ctx, mock.AnythingOfType("uuid.UUID"), 1, 100).Return([]payout.Payout{}, 0, nil)
+	repo.On("FindByCircleAndRound", ctx, mock.AnythingOfType("uuid.UUID"), 1).Return(nil, apperrors.ErrNotFound)
 	// Wallet lookup fails (e.g. user was deleted).
 	wallets.On("WalletAddressForUser", ctx, recipientID).Return("", errors.New("user not found"))
 	// Still persisted as pending — horizon is not consulted.

@@ -138,8 +138,15 @@ func (s *lifecycleCircleService) GetMembers(
 	return []circle.CircleMember{}, nil
 }
 
-func (s *lifecycleCircleService) IsMember(_ context.Context, _, _ string) (bool, error) {
-	return false, nil
+func (s *lifecycleCircleService) IsMember(_ context.Context, _, userID string) (bool, error) {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return false, nil
+	}
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	_, ok := s.store.members[uid]
+	return ok, nil
 }
 
 func (s *lifecycleCircleService) RemoveMember(_ context.Context, _, _, _ string, _ string) error {
@@ -223,6 +230,24 @@ func (s *lifecyclePayoutService) Record(
 	return &record, nil
 }
 
+func (s *lifecyclePayoutService) GetRoundPayout(
+	_ context.Context, circleID string, round int,
+) (*payout.Payout, error) {
+	cid, err := uuid.Parse(circleID)
+	if err != nil {
+		return nil, err
+	}
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	for i := range s.store.payouts {
+		if s.store.payouts[i].CircleID == cid && s.store.payouts[i].RoundNumber == round {
+			record := s.store.payouts[i]
+			return &record, nil
+		}
+	}
+	return nil, nil
+}
+
 func (s *lifecyclePayoutService) UpdateVerification(
 	_ context.Context, _ string, _ bool, _ payout.VerificationStatus,
 ) error {
@@ -303,7 +328,7 @@ func TestCircleLifecycleEndpoints(t *testing.T) {
 	assert.Equal(t, circle.CircleStatusActive, store.circle.Status)
 
 	code, response = lifecycleRequest(t, router, http.MethodPost, "/circles/"+circleID+"/contribute", member.String(), map[string]any{
-		"amount": 100, "txnHash": "contribution-hash", "roundNumber": 1,
+		"amount": 100, "txnHash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef", "roundNumber": 1,
 	})
 	require.Equal(t, http.StatusCreated, code)
 	contributionData := response["data"].(map[string]any)["contribution"].(map[string]any)
@@ -318,9 +343,10 @@ func TestCircleLifecycleEndpoints(t *testing.T) {
 	previewData := response["data"].(map[string]any)["preview"].(map[string]any)
 	assert.Equal(t, true, previewData["dryRun"])
 	assert.Equal(t, float64(100), previewData["totalGrossAmount"])
-	assert.Equal(t, float64(1), previewData["protocolFee"])
-	assert.Equal(t, float64(99), previewData["totalNetAmount"])
+	assert.Equal(t, float64(0.5), previewData["protocolFee"])
+	assert.Equal(t, float64(99.5), previewData["totalNetAmount"])
 	assert.Equal(t, float64(0.00001), previewData["stellarFeeEstimate"])
+	assert.Equal(t, float64(0.001), previewData["arcFeeEstimate"])
 	require.Len(t, store.payouts, 0, "preview must not record any payout")
 
 	// Test 2: TriggerPayout with ?dry_run=true
@@ -334,7 +360,7 @@ func TestCircleLifecycleEndpoints(t *testing.T) {
 
 	code, response = lifecycleRequest(t, router, http.MethodPost, "/circles/"+circleID+"/payout", organizer.String(), map[string]any{
 		"recipientId": member.String(), "roundNumber": 1, "amount": 100,
-		"feeAmount": 0, "txnHash": "payout-hash", "payoutType": "fixed",
+		"feeAmount": 0, "txnHash": "0xab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12", "payoutType": "fixed",
 	})
 	require.Equal(t, http.StatusCreated, code)
 	assert.Equal(t, "active", response["data"].(map[string]any)["status"])
@@ -581,7 +607,7 @@ func TestCircleLifecycle_TriggerPayout_NonOrganizer(t *testing.T) {
 
 	code, _ = lifecycleRequest(t, router, http.MethodPost, "/circles/"+circleID+"/payout", member.String(), map[string]any{
 		"recipientId": member.String(), "roundNumber": 1, "amount": 100,
-		"feeAmount": 0, "txnHash": "payout-hash", "payoutType": "fixed",
+		"feeAmount": 0, "txnHash": "0xab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12", "payoutType": "fixed",
 	})
 	assert.Equal(t, http.StatusForbidden, code)
 }
@@ -619,4 +645,146 @@ func TestCircleLifecycle_GetMembers_Empty(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), `"members":[]`)
+}
+
+// setupPayoutGuardCircle creates a 3-member active circle (organizer + two
+// members) on round 1 and returns the router plus ids.
+func setupPayoutGuardCircle(t *testing.T) (*lifecycleStore, http.Handler, string, uuid.UUID, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	store := newLifecycleStore()
+	organizer, member, other := uuid.New(), uuid.New(), uuid.New()
+
+	circleService := &lifecycleCircleService{store: store}
+	payoutService := &lifecyclePayoutService{store: store}
+	h := handler.NewCircleHandler(circleService, nil, nil, payoutService)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("userID", c.GetHeader("X-Test-User"))
+		c.Next()
+	})
+	router.POST("/circles", h.CreateCircle)
+	router.POST("/circles/:id/join", h.JoinCircle)
+	router.POST("/circles/:id/start", h.StartCircle)
+	router.POST("/circles/:id/payout", h.TriggerPayout)
+	router.POST("/circles/:id/payout/preview", h.PreviewPayout)
+
+	code, response := lifecycleRequest(t, router, http.MethodPost, "/circles", organizer.String(), map[string]any{
+		"name": "Guard Circle", "circleType": "public", "payoutType": "fixed",
+		"contributionAmount": 100, "currency": "USDC", "frequency": "weekly",
+		"maxMembers": 3, "maxStrikes": 3,
+	})
+	require.Equal(t, http.StatusCreated, code)
+	circleID := response["data"].(map[string]any)["circle"].(map[string]any)["id"].(string)
+
+	for _, m := range []uuid.UUID{member, other} {
+		code, _ = lifecycleRequest(t, router, http.MethodPost, "/circles/"+circleID+"/join", m.String(), map[string]any{})
+		require.Equal(t, http.StatusOK, code)
+	}
+	code, _ = lifecycleRequest(t, router, http.MethodPost, "/circles/"+circleID+"/start", organizer.String(), nil)
+	require.Equal(t, http.StatusOK, code)
+	return store, router, circleID, organizer, member, other
+}
+
+func TestCircleLifecycle_TriggerPayout_RoundDueGuards(t *testing.T) {
+	_, router, circleID, organizer, member, _ := setupPayoutGuardCircle(t)
+	payoutPath := "/circles/" + circleID + "/payout"
+
+	// Future rounds are never due: circle is on round 1.
+	code, _ := lifecycleRequest(t, router, http.MethodPost, payoutPath, organizer.String(), map[string]any{
+		"recipientId": member.String(), "roundNumber": 2, "amount": 100,
+		"feeAmount": 0, "txnHash": "0xab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12", "payoutType": "fixed",
+	})
+	assert.Equal(t, http.StatusBadRequest, code)
+
+	// The on-chain receipt is required: no txnHash, no payout.
+	code, _ = lifecycleRequest(t, router, http.MethodPost, payoutPath, organizer.String(), map[string]any{
+		"recipientId": member.String(), "roundNumber": 1, "amount": 100,
+		"feeAmount": 0, "payoutType": "fixed",
+	})
+	assert.Equal(t, http.StatusUnprocessableEntity, code)
+
+	// Wrong-rail receipts are rejected: Stellar-style hashes fail fast.
+	code, _ = lifecycleRequest(t, router, http.MethodPost, payoutPath, organizer.String(), map[string]any{
+		"recipientId": member.String(), "roundNumber": 1, "amount": 100,
+		"feeAmount": 0, "txnHash": "stellar-style-hash", "payoutType": "fixed",
+	})
+	assert.Equal(t, http.StatusUnprocessableEntity, code)
+
+	// The recipient must be a circle member.
+	code, _ = lifecycleRequest(t, router, http.MethodPost, payoutPath, organizer.String(), map[string]any{
+		"recipientId": uuid.New().String(), "roundNumber": 1, "amount": 100,
+		"feeAmount": 0, "txnHash": "0xab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12", "payoutType": "fixed",
+	})
+	assert.Equal(t, http.StatusForbidden, code)
+
+	// First distribution for round 1 succeeds.
+	code, _ = lifecycleRequest(t, router, http.MethodPost, payoutPath, organizer.String(), map[string]any{
+		"recipientId": member.String(), "roundNumber": 1, "amount": 100,
+		"feeAmount": 0, "txnHash": "0xab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12", "payoutType": "fixed",
+	})
+	assert.Equal(t, http.StatusCreated, code)
+}
+
+func TestCircleLifecycle_TriggerPayout_DoublePayoutGuard(t *testing.T) {
+	store, router, circleID, organizer, member, other := setupPayoutGuardCircle(t)
+	payoutPath := "/circles/" + circleID + "/payout"
+
+	code, _ := lifecycleRequest(t, router, http.MethodPost, payoutPath, organizer.String(), map[string]any{
+		"recipientId": member.String(), "roundNumber": 1, "amount": 100,
+		"feeAmount": 0, "txnHash": "0xab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab11", "payoutType": "fixed",
+	})
+	require.Equal(t, http.StatusCreated, code)
+	require.Len(t, store.payouts, 1)
+
+	// Same recipient replay is idempotent: 200 with the existing record, no
+	// second row.
+	code, response := lifecycleRequest(t, router, http.MethodPost, payoutPath, organizer.String(), map[string]any{
+		"recipientId": member.String(), "roundNumber": 1, "amount": 100,
+		"feeAmount": 0, "txnHash": "0xab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12", "payoutType": "fixed",
+	})
+	assert.Equal(t, http.StatusOK, code)
+	assert.Equal(t, true, response["data"].(map[string]any)["duplicate"])
+	require.Len(t, store.payouts, 1, "replay must not record a second payout")
+
+	// A different recipient for the already-paid round is a conflict.
+	code, _ = lifecycleRequest(t, router, http.MethodPost, payoutPath, organizer.String(), map[string]any{
+		"recipientId": other.String(), "roundNumber": 1, "amount": 100,
+		"feeAmount": 0, "txnHash": "0xab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab13", "payoutType": "fixed",
+	})
+	assert.Equal(t, http.StatusConflict, code)
+	require.Len(t, store.payouts, 1, "conflicting trigger must not record a payout")
+}
+
+func TestCircleLifecycle_PreviewPayout_DueFlag(t *testing.T) {
+	_, router, circleID, organizer, member, _ := setupPayoutGuardCircle(t)
+	previewPath := "/circles/" + circleID + "/payout/preview"
+	payoutPath := "/circles/" + circleID + "/payout"
+
+	// Round 1 is due before distribution.
+	code, response := lifecycleRequest(t, router, http.MethodPost, previewPath, organizer.String(), map[string]any{
+		"recipientId": member.String(), "roundNumber": 1,
+	})
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, true, response["data"].(map[string]any)["preview"].(map[string]any)["isDue"])
+
+	// Preview for a non-member recipient is rejected.
+	code, _ = lifecycleRequest(t, router, http.MethodPost, previewPath, organizer.String(), map[string]any{
+		"recipientId": uuid.New().String(), "roundNumber": 1,
+	})
+	assert.Equal(t, http.StatusBadRequest, code)
+
+	// After the round is paid, the same preview reports not due.
+	code, _ = lifecycleRequest(t, router, http.MethodPost, payoutPath, organizer.String(), map[string]any{
+		"recipientId": member.String(), "roundNumber": 1, "amount": 100,
+		"feeAmount": 0, "txnHash": "0xab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab14", "payoutType": "fixed",
+	})
+	require.Equal(t, http.StatusCreated, code)
+
+	code, response = lifecycleRequest(t, router, http.MethodPost, previewPath, organizer.String(), map[string]any{
+		"recipientId": member.String(), "roundNumber": 1,
+	})
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, false, response["data"].(map[string]any)["preview"].(map[string]any)["isDue"])
 }

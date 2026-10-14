@@ -67,6 +67,12 @@ func (r *pgRepo) FindByTxnHash(ctx context.Context, txnHash string) (*Payout, er
 	return scanPayout(r.db.QueryRowxContext(ctx, query, txnHash))
 }
 
+func (r *pgRepo) FindByCircleAndRound(ctx context.Context, circleID uuid.UUID, round int) (*Payout, error) {
+	query := `SELECT id, circle_id, recipient_id, round_number, amount, fee_amount, txn_hash, payout_type, verified_onchain, verification_status, created_at
+		FROM payouts WHERE circle_id = $1 AND round_number = $2 LIMIT 1`
+	return scanPayout(r.db.QueryRowxContext(ctx, query, circleID, round))
+}
+
 func (r *pgRepo) Create(ctx context.Context, p *Payout) error {
 	query := `INSERT INTO payouts (id, circle_id, recipient_id, round_number, amount, fee_amount, txn_hash, payout_type, verified_onchain, verification_status, created_at)
 		VALUES (:id, :circle_id, :recipient_id, :round_number, :amount, :fee_amount, :txn_hash, :payout_type, :verified_onchain, :verification_status, :created_at)`

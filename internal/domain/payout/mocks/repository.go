@@ -29,6 +29,14 @@ func (m *Repository) FindByTxnHash(ctx context.Context, txnHash string) (*payout
 	return args.Get(0).(*payout.Payout), args.Error(1)
 }
 
+func (m *Repository) FindByCircleAndRound(ctx context.Context, circleID uuid.UUID, round int) (*payout.Payout, error) {
+	args := m.Called(ctx, circleID, round)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*payout.Payout), args.Error(1)
+}
+
 func (m *Repository) Create(ctx context.Context, p *payout.Payout) error {
 	return m.Called(ctx, p).Error(0)
 }

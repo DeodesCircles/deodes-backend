@@ -41,6 +41,9 @@ func (h *PayoutHandler) ListPayouts(c *gin.Context) {
 			response.InternalError(c, "failed to list payouts")
 			return
 		}
+		if payouts == nil {
+			payouts = []payout.Payout{}
+		}
 		response.OKWithMeta(c, gin.H{"payouts": payouts}, response.NewPaginationMeta(page, limit, total))
 		return
 	}
@@ -51,6 +54,9 @@ func (h *PayoutHandler) ListPayouts(c *gin.Context) {
 			response.InternalError(c, "failed to list payouts")
 			return
 		}
+		if payouts == nil {
+			payouts = []payout.Payout{}
+		}
 		response.OKWithMeta(c, gin.H{"payouts": payouts}, response.NewPaginationMeta(page, limit, total))
 		return
 	}
@@ -60,6 +66,9 @@ func (h *PayoutHandler) ListPayouts(c *gin.Context) {
 	if err != nil {
 		response.InternalError(c, "failed to list payouts")
 		return
+	}
+	if payouts == nil {
+		payouts = []payout.Payout{}
 	}
 	response.OKWithMeta(c, gin.H{"payouts": payouts}, response.NewPaginationMeta(page, limit, total))
 }

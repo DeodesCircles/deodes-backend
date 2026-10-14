@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,6 +15,22 @@ import (
 	"github.com/deodes/backend/pkg/money"
 	"github.com/rs/zerolog/log"
 )
+
+// isArcTxHash reports whether s looks like an EVM (Arc) transaction hash:
+// 0x followed by 64 hex characters. Stellar Horizon cannot verify these, so
+// the service records them as pending for the Arc indexer instead of hitting
+// Horizon and burning a lookup on every contribution.
+func isArcTxHash(s string) bool {
+	if len(s) != 66 || !strings.HasPrefix(s, "0x") && !strings.HasPrefix(s, "0X") {
+		return false
+	}
+	for _, r := range s[2:] {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F') {
+			return false
+		}
+	}
+	return true
+}
 
 // RecordInput carries all fields needed to record a contribution.
 type RecordInput struct {
@@ -143,6 +160,18 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Contribution,
 	if err != nil {
 		return nil, fmt.Errorf("invalid userID: %w", err)
 	}
+	// Defense-in-depth amount/round validation (handler validates too, but the
+	// indexer and tests call Record directly). money.FromFloat64 rejects
+	// NaN/Inf/overflow without panicking.
+	if _, err := money.FromFloat64(input.Amount); err != nil {
+		return nil, fmt.Errorf("invalid contribution amount: %w", err)
+	}
+	if input.Amount <= 0 {
+		return nil, fmt.Errorf("invalid contribution amount: must be greater than 0")
+	}
+	if input.RoundNumber < 1 {
+		return nil, fmt.Errorf("invalid roundNumber: must be at least 1")
+	}
 
 	// Reject contribution if payout scheduling has begun for this round
 	if input.PayoutScheduled {
@@ -187,9 +216,18 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Contribution,
 		verificationStatus = *input.VerificationStatus
 	}
 
-	// On-chain verification: only run when horizon client is available and
-	// the caller has NOT already supplied an explicit verification state.
-	if s.horizon != nil && input.TxnHash != "" &&
+	// Arc EVM hashes (0x…) cannot be verified by Stellar Horizon. Record
+	// them as pending for the Arc indexer instead of wasting a Horizon
+	// lookup that can only fail.
+	isArcHash := isArcTxHash(input.TxnHash)
+	if isArcHash && input.VerifiedOnchain == nil && input.VerificationStatus == nil {
+		verificationStatus = VerificationStatusPending
+	}
+
+	// On-chain verification: only run when horizon client is available, the
+	// caller has NOT already supplied an explicit verification state, and the
+	// hash is NOT an Arc EVM hash (handled above).
+	if s.horizon != nil && input.TxnHash != "" && !isArcHash &&
 		input.VerifiedOnchain == nil && input.VerificationStatus == nil {
 
 		amount, amtErr := money.FromFloat64(input.Amount)

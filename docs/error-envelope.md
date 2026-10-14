@@ -1,6 +1,6 @@
 # API Error Envelope Specification
 
-All error responses returned by the Moistello Backend API adhere to a single unified contract for frontend consumption:
+All error responses returned by the Deodes Backend API adhere to a single unified contract for frontend consumption:
 
 ```json
 {

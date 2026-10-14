@@ -19,12 +19,12 @@ import (
 func TestIntegration_Contribution_VerificationStatusFlow(t *testing.T) {
 	ctx := context.Background()
 	repo := new(contribMocks.Repository)
-	svc := contribution.NewService(repo, nil, nil, nil, "", nil)
+	svc := contribution.NewService(repo, nil, nil, nil)
 
 	circleID := uuid.New().String()
 	userID := uuid.New().String()
 
-	t.Run("client-supplied contribution defaults to unverified", func(t *testing.T) {
+	t.Run("client-supplied contribution defaults to pending", func(t *testing.T) {
 		input := contribution.RecordInput{
 			CircleID:    circleID,
 			UserID:      userID,
@@ -36,7 +36,7 @@ func TestIntegration_Contribution_VerificationStatusFlow(t *testing.T) {
 		repo.On("FindByTxnHash", ctx, "tx_client_unverified_1").Return(nil, apperrors.ErrNotFound).Once()
 		repo.On("Create", ctx, mock.MatchedBy(func(c *contribution.Contribution) bool {
 			return c.VerifiedOnchain == false &&
-				c.VerificationStatus == contribution.VerificationStatusUnverified &&
+				c.VerificationStatus == contribution.VerificationStatusPending &&
 				c.Amount == 100.0 &&
 				c.TxnHash.String == "tx_client_unverified_1"
 		})).Return(nil).Once()
@@ -44,7 +44,7 @@ func TestIntegration_Contribution_VerificationStatusFlow(t *testing.T) {
 		record, err := svc.Record(ctx, input)
 		require.NoError(t, err)
 		assert.False(t, record.VerifiedOnchain)
-		assert.Equal(t, contribution.VerificationStatusUnverified, record.VerificationStatus)
+		assert.Equal(t, contribution.VerificationStatusPending, record.VerificationStatus)
 	})
 
 	t.Run("indexer or verified flow creates verified record", func(t *testing.T) {
@@ -88,7 +88,7 @@ func TestIntegration_Contribution_VerificationStatusFlow(t *testing.T) {
 func TestIntegration_Payout_VerificationStatusFlow(t *testing.T) {
 	ctx := context.Background()
 	repo := new(payoutMocks.Repository)
-	svc := payout.NewService(repo, nil, nil, nil)
+	svc := payout.NewService(repo, nil, nil)
 
 	circleUUID := uuid.New()
 	circleID := circleUUID.String()
@@ -97,7 +97,7 @@ func TestIntegration_Payout_VerificationStatusFlow(t *testing.T) {
 	repo.On("FindByCircleAndRound", ctx, circleUUID, 1).Return(nil, apperrors.ErrNotFound)
 	repo.On("FindByCircleAndRound", ctx, circleUUID, 2).Return(nil, apperrors.ErrNotFound)
 
-	t.Run("client-supplied payout defaults to unverified", func(t *testing.T) {
+	t.Run("client-supplied payout defaults to pending", func(t *testing.T) {
 		input := payout.RecordInput{
 			CircleID:    circleID,
 			RecipientID: recipientID,
@@ -111,14 +111,14 @@ func TestIntegration_Payout_VerificationStatusFlow(t *testing.T) {
 		repo.On("FindByTxnHash", ctx, "tx_payout_unverified_1").Return(nil, apperrors.ErrNotFound).Once()
 		repo.On("Create", ctx, mock.MatchedBy(func(p *payout.Payout) bool {
 			return p.VerifiedOnchain == false &&
-				p.VerificationStatus == payout.VerificationStatusUnverified &&
+				p.VerificationStatus == payout.VerificationStatusPending &&
 				p.Amount == 500.0
 		})).Return(nil).Once()
 
 		record, err := svc.Record(ctx, input)
 		require.NoError(t, err)
 		assert.False(t, record.VerifiedOnchain)
-		assert.Equal(t, payout.VerificationStatusUnverified, record.VerificationStatus)
+		assert.Equal(t, payout.VerificationStatusPending, record.VerificationStatus)
 	})
 
 	t.Run("verified onchain payout execution", func(t *testing.T) {

@@ -30,10 +30,10 @@ type Service struct {
 
 func NewService(cfg Config) *Service {
 	if cfg.FromAddress == "" {
-		cfg.FromAddress = "noreply@moistello.com"
+		cfg.FromAddress = "noreply@deodes.com"
 	}
 	if cfg.FromName == "" {
-		cfg.FromName = "Moistello"
+		cfg.FromName = "Deodes"
 	}
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://api.brevo.com/v3/smtp/email"
@@ -57,8 +57,8 @@ func (s *Service) WithHTTPClient(client *http.Client) *Service {
 
 // SendOTP sends a 6-digit verification code to the user's email.
 func (s *Service) SendOTP(ctx context.Context, email, code string) error {
-	subject := "Your Moistello verification code"
-	body := fmt.Sprintf(`<p>Your Moistello verification code is:</p>
+	subject := "Your Deodes verification code"
+	body := fmt.Sprintf(`<p>Your Deodes verification code is:</p>
 <h2 style="font-size:28px;letter-spacing:6px;text-align:center;padding:16px;background:#f5f5f5;border-radius:8px;font-family:monospace">%s</h2>
 <p>This code expires in <strong>5 minutes</strong>. If you did not request this code, please ignore this email.</p>`, code)
 	return s.sendBrevo(ctx, email, subject, body)
@@ -66,7 +66,7 @@ func (s *Service) SendOTP(ctx context.Context, email, code string) error {
 
 // SendBackupCodes sends backup codes to the user's email.
 func (s *Service) SendBackupCodes(ctx context.Context, email string, codes []string) error {
-	subject := "Your Moistello backup codes"
+	subject := "Your Deodes backup codes"
 	body := `<p>Save these backup codes in a secure place. Each code can be used <strong>only once</strong> to access your account if you lose your authenticator device.</p><br>`
 	for _, c := range codes {
 		body += fmt.Sprintf(`<code style="display:block;font-size:16px;padding:4px 8px;background:#f5f5f5;border-radius:4px;margin:4px 0;font-family:monospace">%s</code>`, c)
@@ -85,8 +85,8 @@ func (s *Service) SendNotification(ctx context.Context, to, subject, body string
 
 // SendRecoveryCode sends a one-time recovery code.
 func (s *Service) SendRecoveryCode(ctx context.Context, email, code string) error {
-	subject := "Your Moistello account recovery code"
-	body := fmt.Sprintf(`<p>Your Moistello recovery code is:</p>
+	subject := "Your Deodes account recovery code"
+	body := fmt.Sprintf(`<p>Your Deodes recovery code is:</p>
 <h2 style="font-size:28px;letter-spacing:6px;text-align:center;padding:16px;background:#f5f5f5;border-radius:8px;font-family:monospace">%s</h2>
 <p>This code expires in <strong>15 minutes</strong>. If you did not request this code, please secure your account immediately.</p>`, code)
 	return s.sendBrevo(ctx, email, subject, body)

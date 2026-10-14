@@ -3,23 +3,25 @@ package config
 import (
 	"bufio"
 	"encoding/hex"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/spf13/viper"
 )
 
+// arcAddressRegexp mirrors pkg/arc.ValidateAddress (0.7 validator style).
+// Duplicated here so the config package stays dependency-free.
+var arcAddressRegexp = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
+
 type Config struct {
 	Server       ServerConfig
 	Database     DatabaseConfig
 	Redis        RedisConfig
 	RabbitMQ     RabbitMQConfig
-	Stellar      StellarConfig
-	Contracts    map[string]string `mapstructure:"contracts"`
 	Auth         AuthConfig
 	Security     SecurityConfig
 	Brevo        BrevoConfig
@@ -94,31 +96,6 @@ type RabbitMQConfig struct {
 	} `mapstructure:"queues"`
 }
 
-type StellarConfig struct {
-	Network                   string  `mapstructure:"network"`
-	HorizonURL                string  `mapstructure:"horizon_url"`
-	SorobanRPCURL             string  `mapstructure:"soroban_rpc_url"`
-	NetworkPassphrase         string  `mapstructure:"network_passphrase"`
-	MasterPublicKey           string  `mapstructure:"master_public_key"`
-	MasterSecretKey           string  `mapstructure:"master_secret_key"`
-	USDCIssuer                string  `mapstructure:"usdc_issuer"`
-	WalletMinBalance          float64 `mapstructure:"wallet_min_balance"`
-	GovernanceTokenContractID string  `mapstructure:"governance_token_contract_id"`
-	EscrowSwapContractID      string  `mapstructure:"escrow_swap_contract_id"`
-}
-
-func (s StellarConfig) MarshalJSON() ([]byte, error) {
-	type alias StellarConfig
-	return json.Marshal(&struct{ alias }{alias: alias(s)})
-}
-
-func (s StellarConfig) String() string {
-	if s.MasterSecretKey != "" {
-		return "{... redacted ...}"
-	}
-	return "{...}"
-}
-
 // MobileMoneyConfig holds credentials for the mobile-money bridge (#190,
 // product-spec.md §7): M-Pesa, MTN Mobile Money, and Airtel Money adapters
 // for non-NGN African markets. Each provider is only registered at startup
@@ -154,13 +131,22 @@ type MobileMoneyConfig struct {
 // contract address has no safe default — look it up at
 // docs.arc.io/arc/references/contract-addresses.md for the target network.
 // Empty USDCContract fails fast at transfer time, never at boot — except in
-// mainnet mode (environment production/mainnet or stellar.network mainnet),
+// mainnet mode (environment production/mainnet),
 // where the startup guard (checkMainnetIssues) rejects an empty rpc_url, a
 // testnet rpc_url, an empty usdc_contract, and any chain_id other than 5042.
 type ArcConfig struct {
 	RPCURL       string `mapstructure:"rpc_url"`
 	ChainID      uint64 `mapstructure:"chain_id"`
 	USDCContract string `mapstructure:"usdc_contract"`
+	// CircleAddress is the DeodesCircle deployment for the target network.
+	// Source of truth: deodes-contracts/deployments.{testnet,mainnet}.json
+	// (Phase 0.5 freeze). Empty fails fast at call time, never at boot —
+	// except in mainnet mode, where the startup guard rejects it.
+	CircleAddress string `mapstructure:"circle_address"`
+	// TreasuryAddress is the protocol-fee vault (DeodesCircle treasury).
+	// MUST differ from keeper.escrow_address (user-debit collector):
+	// commingling them was frozen out in Phase 0.6 scope.
+	TreasuryAddress string `mapstructure:"treasury_address"`
 }
 
 // KeeperConfig drives the auto-debit subscription loop. Empty EscrowAddress
@@ -203,7 +189,7 @@ type AuthConfig struct {
 type SecurityConfig struct {
 	// WalletPepper is the single server-side secret used for deterministic
 	// wallet seed derivation. The former, unused PasskeyPepper field and its
-	// MOISTELLO_PASSKEY_PEPPER env binding were removed in #163 so there is
+	// DEODES_PASSKEY_PEPPER env binding were removed in #163 so there is
 	// exactly one pepper source of truth.
 	WalletPepper  string `mapstructure:"wallet_pepper"`
 	EncryptionKey string `mapstructure:"encryption_key"`
@@ -229,6 +215,10 @@ type IndexerConfig struct {
 	PollInterval time.Duration `mapstructure:"poll_interval"`
 	BatchSize    int           `mapstructure:"batch_size"`
 	StartLedger  int64         `mapstructure:"start_ledger"`
+	// StartBlock is the Arc backfill origin (2.6): the first block polled
+	// when no arc_cursor row exists. Set to the circle/factory deployment
+	// block to skip empty history; 0 means genesis.
+	StartBlock uint64 `mapstructure:"start_block"`
 	// MaxCursorLag is how long the cursor's last_processed_at may trail the
 	// current time before the health server reports the indexer as unhealthy.
 	MaxCursorLag time.Duration `mapstructure:"max_cursor_lag"`
@@ -340,8 +330,8 @@ func newViper() *viper.Viper {
 	v.SetConfigType("yaml")
 	v.AddConfigPath("./config")
 	v.AddConfigPath(".")
-	v.AddConfigPath("/etc/moistello/")
-	v.SetEnvPrefix("MOISTELLO")
+	v.AddConfigPath("/etc/deodes/")
+	v.SetEnvPrefix("DEODES")
 	v.AutomaticEnv()
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	return v
@@ -365,18 +355,14 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "redis.url", "redis://localhost:6379")
 	setDefault(v, "redis.pool_size", 20)
 	setDefault(v, "rabbitmq.url", "amqp://guest:guest@localhost:5672/")
-	setDefault(v, "rabbitmq.exchange", "moistello.events")
-	setDefault(v, "rabbitmq.queues.notifications", "moistello.notifications")
-	setDefault(v, "rabbitmq.queues.webhooks", "moistello.webhooks")
-	setDefault(v, "stellar.network", "testnet")
-	setDefault(v, "stellar.horizon_url", "https://horizon-testnet.stellar.org")
-	setDefault(v, "stellar.soroban_rpc_url", "https://soroban-testnet.stellar.org")
-	setDefault(v, "stellar.network_passphrase", "Test SDF Network ; September 2015")
-	setDefault(v, "stellar.usdc_issuer", "GAX23V3WWDPPR5WRER3KTEUTDLSCGZYMSJY5FDRRKKCIQ4JADF5T27RC")
-	setDefault(v, "stellar.wallet_min_balance", 10.0)
+	setDefault(v, "rabbitmq.exchange", "deodes.events")
+	setDefault(v, "rabbitmq.queues.notifications", "deodes.notifications")
+	setDefault(v, "rabbitmq.queues.webhooks", "deodes.webhooks")
 	setDefault(v, "arc.rpc_url", "")
-	setDefault(v, "arc.chain_id", uint64(5042002))
+	setDefault(v, "arc.chain_id", uint64(5042))
 	setDefault(v, "arc.usdc_contract", "")
+	setDefault(v, "arc.circle_address", "")
+	setDefault(v, "arc.treasury_address", "")
 	setDefault(v, "keeper.escrow_address", "")
 	setDefault(v, "keeper.interval_minutes", 15)
 	setDefault(v, "auth.access_token_ttl", "15m")
@@ -391,10 +377,11 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "security.argon2_threads", 4)
 	setDefault(v, "brevo.api_key", "")
 	setDefault(v, "google.client_id", "")
-	setDefault(v, "brevo.from_email", "noreply@moistello.com")
-	setDefault(v, "brevo.from_name", "Moistello")
+	setDefault(v, "brevo.from_email", "noreply@deodes.com")
+	setDefault(v, "brevo.from_name", "Deodes")
 	setDefault(v, "indexer.poll_interval", "3s")
 	setDefault(v, "indexer.batch_size", 50)
+	setDefault(v, "indexer.start_block", uint64(0))
 	setDefault(v, "indexer.max_cursor_lag", "2m")
 	setDefault(v, "indexer.reorg_window", 10)
 	setDefault(v, "indexer.stall_threshold", "5m")
@@ -442,17 +429,17 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "security.passkey_pepper", "")
 	setDefault(v, "security.encryption_key", "")
 
-	mustBindEnv(v, "environment", "DEODES_ENVIRONMENT", "MOISTELLO_ENVIRONMENT", "NODE_ENV")
-	mustBindEnv(v, "database.url", "DEODES_DATABASE_URL", "MOISTELLO_DATABASE_URL", "DATABASE_URL")
-	mustBindEnv(v, "database.replica_url", "DEODES_DATABASE_REPLICA_URL", "MOISTELLO_DATABASE_REPLICA_URL", "DATABASE_REPLICA_URL")
-	mustBindEnv(v, "stellar.master_secret_key", "DEODES_STELLAR_MASTER_SECRET_KEY", "MOISTELLO_STELLAR_MASTER_SECRET_KEY", "STELLAR_MASTER_SECRET_KEY")
-	mustBindEnv(v, "stellar.master_public_key", "DEODES_STELLAR_MASTER_PUBLIC_KEY", "MOISTELLO_STELLAR_MASTER_PUBLIC_KEY", "STELLAR_MASTER_PUBLIC_KEY")
+	mustBindEnv(v, "environment", "DEODES_ENVIRONMENT", "NODE_ENV")
+	mustBindEnv(v, "database.url", "DEODES_DATABASE_URL", "DATABASE_URL")
+	mustBindEnv(v, "database.replica_url", "DEODES_DATABASE_REPLICA_URL", "DATABASE_REPLICA_URL")
 	mustBindEnv(v, "arc.rpc_url", "DEODES_ARC_RPC_URL", "ARC_RPC_URL")
 	mustBindEnv(v, "arc.chain_id", "DEODES_ARC_CHAIN_ID", "ARC_CHAIN_ID")
 	mustBindEnv(v, "arc.usdc_contract", "DEODES_ARC_USDC_CONTRACT", "ARC_USDC_CONTRACT")
+	mustBindEnv(v, "arc.circle_address", "DEODES_CIRCLE_ADDRESS", "ARC_CIRCLE_ADDRESS")
+	mustBindEnv(v, "arc.treasury_address", "DEODES_TREASURY_ADDRESS", "ARC_TREASURY_ADDRESS")
 	mustBindEnv(v, "keeper.escrow_address", "DEODES_KEEPER_ESCROW_ADDRESS", "KEEPER_ESCROW_ADDRESS")
 	mustBindEnv(v, "keeper.interval_minutes", "DEODES_KEEPER_INTERVAL_MINUTES", "KEEPER_INTERVAL_MINUTES")
-	mustBindEnv(v, "security.wallet_pepper", "DEODES_SECURITY_WALLET_PEPPER", "MOISTELLO_WALLET_PEPPER")
+	mustBindEnv(v, "security.wallet_pepper", "DEODES_SECURITY_WALLET_PEPPER", "DEODES_WALLET_PEPPER")
 	mustBindEnv(v, "security.encryption_key", "DEODES_SECURITY_ENCRYPTION_KEY", "ENCRYPTION_KEY")
 	mustBindEnv(v, "auth.jwt_private_key_pem", "DEODES_AUTH_JWT_PRIVATE_KEY_PEM", "JWT_PRIVATE_KEY")
 	mustBindEnv(v, "auth.jwt_public_key_pem", "DEODES_AUTH_JWT_PUBLIC_KEY_PEM", "JWT_PUBLIC_KEY")
@@ -460,15 +447,15 @@ func Load(path string) (*Config, error) {
 	mustBindEnv(v, "auth.jwt_previous_private_key_pem", "DEODES_AUTH_JWT_PREVIOUS_PRIVATE_KEY_PEM", "JWT_PREVIOUS_PRIVATE_KEY", "JWT_PREVIOUS_PRIVATE_KEY_PEM")
 	mustBindEnv(v, "auth.jwt_previous_public_key_pem", "DEODES_AUTH_JWT_PREVIOUS_PUBLIC_KEY_PEM", "JWT_PREVIOUS_PUBLIC_KEY", "JWT_PREVIOUS_PUBLIC_KEY_PEM")
 	mustBindEnv(v, "auth.jwt_previous_kid", "DEODES_AUTH_JWT_PREVIOUS_KID", "JWT_PREVIOUS_KID")
-	mustBindEnv(v, "brevo.api_key", "DEODES_BREVO_API_KEY", "MOISTELLO_BREVO_API_KEY", "MOISTELLO_NOTIFICATION_EMAIL_APIKEY", "MOISTELLO_EMAIL_API_KEY")
+	mustBindEnv(v, "brevo.api_key", "DEODES_BREVO_API_KEY", "DEODES_NOTIFICATION_EMAIL_APIKEY", "DEODES_EMAIL_API_KEY")
 	mustBindEnv(v, "google.client_id", "DEODES_GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_ID")
-	mustBindEnv(v, "brevo.from_email", "DEODES_BREVO_FROM_EMAIL", "MOISTELLO_BREVO_FROM_EMAIL", "MOISTELLO_NOTIFICATION_EMAIL_FROM_ADDRESS")
-	mustBindEnv(v, "brevo.from_name", "DEODES_BREVO_FROM_NAME", "MOISTELLO_BREVO_FROM_NAME", "MOISTELLO_NOTIFICATION_EMAIL_FROM_NAME")
-	mustBindEnv(v, "cors.allowed_origins", "DEODES_CORS_ALLOWED_ORIGINS", "MOISTELLO_CORS_ALLOWED_ORIGINS", "ALLOWED_ORIGINS")
-	mustBindEnv(v, "redis.url", "DEODES_REDIS_URL", "MOISTELLO_REDIS_URL", "REDIS_URL")
-	mustBindEnv(v, "redis.password", "DEODES_REDIS_PASSWORD", "MOISTELLO_REDIS_PASSWORD", "REDIS_PASSWORD")
-	mustBindEnv(v, "auth.admin_api_key", "DEODES_AUTH_ADMIN_API_KEY", "MOISTELLO_AUTH_ADMIN_API_KEY", "ADMIN_API_KEY")
-	mustBindEnv(v, "auth.admin_api_key_secondary", "DEODES_AUTH_ADMIN_API_KEY_SECONDARY", "MOISTELLO_AUTH_ADMIN_API_KEY_SECONDARY", "ADMIN_API_KEY_SECONDARY")
+	mustBindEnv(v, "brevo.from_email", "DEODES_BREVO_FROM_EMAIL", "DEODES_NOTIFICATION_EMAIL_FROM_ADDRESS")
+	mustBindEnv(v, "brevo.from_name", "DEODES_BREVO_FROM_NAME", "DEODES_NOTIFICATION_EMAIL_FROM_NAME")
+	mustBindEnv(v, "cors.allowed_origins", "DEODES_CORS_ALLOWED_ORIGINS", "ALLOWED_ORIGINS")
+	mustBindEnv(v, "redis.url", "DEODES_REDIS_URL", "REDIS_URL")
+	mustBindEnv(v, "redis.password", "DEODES_REDIS_PASSWORD", "REDIS_PASSWORD")
+	mustBindEnv(v, "auth.admin_api_key", "DEODES_AUTH_ADMIN_API_KEY", "ADMIN_API_KEY")
+	mustBindEnv(v, "auth.admin_api_key_secondary", "DEODES_AUTH_ADMIN_API_KEY_SECONDARY", "ADMIN_API_KEY_SECONDARY")
 	v.SetDefault("auth.admin_api_key", "")
 	v.SetDefault("auth.admin_api_key_secondary", "")
 	v.SetDefault("server.port", 1100)
@@ -482,7 +469,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("server.shutdown_timeout", "30s")
 	v.SetDefault("server.max_body_bytes", 4*1024*1024)
 	v.SetDefault("server.max_body_bytes_routes", map[string]int64{})
-	// No default DATABASE_URL: the env var DATABASE_URL (mapped to MOISTELLO_DATABASE_URL)
+	// No default DATABASE_URL: the env var DATABASE_URL (mapped to DEODES_DATABASE_URL)
 	// must be set explicitly. An empty URL will cause a clear startup failure rather than
 	// silently connecting with plaintext credentials and SSL disabled.
 	v.SetDefault("database.max_open_conns", 50)
@@ -491,36 +478,18 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("redis.url", "redis://localhost:6379")
 	v.SetDefault("redis.pool_size", 20)
 	v.SetDefault("rabbitmq.url", "amqp://guest:guest@localhost:5672/")
-	mustBindEnv(v, "rabbitmq.url", "DEODES_RABBITMQ_URL", "MOISTELLO_RABBITMQ_URL", "RABBITMQ_URL")
-	v.SetDefault("rabbitmq.exchange", "moistello.events")
-	v.SetDefault("rabbitmq.queues.notifications", "moistello.notifications")
-	v.SetDefault("rabbitmq.queues.webhooks", "moistello.webhooks")
-	v.SetDefault("stellar.network", "testnet")
-	v.SetDefault("stellar.horizon_url", "https://horizon-testnet.stellar.org")
-	v.SetDefault("stellar.soroban_rpc_url", "https://soroban-testnet.stellar.org")
-	v.SetDefault("stellar.network_passphrase", "Test SDF Network ; September 2015")
-	v.SetDefault("stellar.governance_token_contract_id", "")
-	mustBindEnv(v, "stellar.governance_token_contract_id", "DEODES_GOVERNANCE_TOKEN_CONTRACT_ID", "MOISTELLO_GOVERNANCE_TOKEN_CONTRACT_ID")
-	v.SetDefault("stellar.escrow_swap_contract_id", "")
-	// Deployed contract IDs: 10-deploy-contracts.sh records them in the
-	// secrets file and 12-backend-env.sh writes them here as MOISTELLO_CONTRACT_*.
-	// Env overrides the git-tracked config.yaml testnet values, so mainnet
-	// cutover never requires editing tracked files. contracts.circle is a
-	// deployed instance ID — NOT the circle WASM hash (CONTRACT_CIRCLE_HASH),
-	// which is a different value with a different home.
-	mustBindEnv(v, "contracts.circle_factory", "DEODES_CONTRACT_FACTORY", "MOISTELLO_CONTRACT_FACTORY")
-	mustBindEnv(v, "contracts.circle", "DEODES_CONTRACT_CIRCLE", "MOISTELLO_CONTRACT_CIRCLE")
-	mustBindEnv(v, "contracts.reputation_registry", "DEODES_CONTRACT_REP_REGISTRY", "MOISTELLO_CONTRACT_REP_REGISTRY")
-	mustBindEnv(v, "contracts.governance_token", "DEODES_CONTRACT_GOV_TOKEN", "MOISTELLO_CONTRACT_GOV_TOKEN")
-	mustBindEnv(v, "contracts.treasury", "DEODES_CONTRACT_TREASURY", "MOISTELLO_CONTRACT_TREASURY")
+	mustBindEnv(v, "rabbitmq.url", "DEODES_RABBITMQ_URL", "RABBITMQ_URL")
+	v.SetDefault("rabbitmq.exchange", "deodes.events")
+	v.SetDefault("rabbitmq.queues.notifications", "deodes.notifications")
+	v.SetDefault("rabbitmq.queues.webhooks", "deodes.webhooks")
 	v.SetDefault("auth.access_token_ttl", "15m")
 	v.SetDefault("auth.refresh_token_ttl", "168h")
 	v.SetDefault("auth.nonce_ttl", "5m")
 	v.SetDefault("auth.cleanup_interval", "5m")
 	v.SetDefault("auth.cleanup_jitter", "30s")
 	v.SetDefault("brevo.api_key", "")
-	v.SetDefault("brevo.from_email", "noreply@moistello.com")
-	v.SetDefault("brevo.from_name", "Moistello")
+	v.SetDefault("brevo.from_email", "noreply@deodes.com")
+	v.SetDefault("brevo.from_name", "Deodes")
 	v.SetDefault("indexer.poll_interval", "3s")
 	v.SetDefault("indexer.batch_size", 50)
 	v.SetDefault("indexer.max_cursor_lag", "2m")
@@ -550,7 +519,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("logging.output", "stdout")
 	v.SetDefault("tracing.enabled", false)
 	v.SetDefault("tracing.collector_endpoint", "localhost:4317")
-	v.SetDefault("tracing.service_name", "moistello-api")
+	v.SetDefault("tracing.service_name", "deodes-api")
 	v.SetDefault("tracing.sample_rate", 0.1)
 	v.SetDefault("environment", "development")
 
@@ -569,10 +538,8 @@ func Load(path string) (*Config, error) {
 
 	var errs []string
 
-	cfg.Database.URL = collectRequiredString(&errs, "database.url", cfg.Database.URL, "set MOISTELLO_DATABASE_URL or DATABASE_URL")
-	cfg.Stellar.MasterSecretKey = collectRequiredString(&errs, "stellar.master_secret_key", cfg.Stellar.MasterSecretKey, "set MOISTELLO_STELLAR_MASTER_SECRET_KEY or STELLAR_MASTER_SECRET_KEY")
-	cfg.Stellar.MasterPublicKey = collectRequiredString(&errs, "stellar.master_public_key", cfg.Stellar.MasterPublicKey, "set MOISTELLO_STELLAR_MASTER_PUBLIC_KEY or STELLAR_MASTER_PUBLIC_KEY")
-	cfg.Security.WalletPepper = collectRequiredString(&errs, "security.wallet_pepper", cfg.Security.WalletPepper, "set MOISTELLO_WALLET_PEPPER")
+	cfg.Database.URL = collectRequiredString(&errs, "database.url", cfg.Database.URL, "set DEODES_DATABASE_URL or DATABASE_URL")
+	cfg.Security.WalletPepper = collectRequiredString(&errs, "security.wallet_pepper", cfg.Security.WalletPepper, "set DEODES_WALLET_PEPPER")
 	cfg.Security.EncryptionKey = collectRequiredString(&errs, "security.encryption_key", cfg.Security.EncryptionKey, "set ENCRYPTION_KEY")
 
 	cfg.Auth.JWTPrivateKeyPEM = collectRequiredText(&errs, cfg.Auth.JWTPrivateKeyPEM, cfg.Auth.JWTPrivateKeyPath, "auth.jwt_private_key_pem", "auth.jwt_private_key_path")
@@ -592,6 +559,22 @@ func Load(path string) (*Config, error) {
 		raw, err := hex.DecodeString(strings.TrimSpace(cfg.Security.EncryptionKey))
 		if err != nil || len(raw) != 32 {
 			errs = append(errs, "config: security.encryption_key must be a 32-byte hex string")
+		}
+	}
+
+	// Phase 2.5: every configured EVM address must be 0x + 40 hex or the
+	// process fails boot here instead of signing/verifying on a typo'd
+	// address. Empty means unset (chain features stay dormant in dev); the
+	// shape check matches pkg/arc.ValidateAddress, duplicated (not imported)
+	// so config stays dependency-free.
+	for _, addr := range []struct{ name, value string }{
+		{"arc.usdc_contract", cfg.Arc.USDCContract},
+		{"arc.circle_address", cfg.Arc.CircleAddress},
+		{"arc.treasury_address", cfg.Arc.TreasuryAddress},
+		{"keeper.escrow_address", cfg.Keeper.EscrowAddress},
+	} {
+		if strings.TrimSpace(addr.value) != "" && !arcAddressRegexp.MatchString(strings.TrimSpace(addr.value)) {
+			errs = append(errs, fmt.Sprintf("config: %s must be 0x + 40 hex chars, got %q (set DEODES_%s)", addr.name, addr.value, strings.ToUpper(strings.ReplaceAll(addr.name, ".", "_"))))
 		}
 	}
 
@@ -750,7 +733,7 @@ func validateDuration(name string, ok bool) {
 }
 
 // isMainnetEnvironment reports whether the operator intends mainnet mode via
-// the environment name rather than stellar.network. Matching is
+// the environment name. Matching is
 // case-insensitive and trims surrounding whitespace.
 func isMainnetEnvironment(env string) bool {
 	switch strings.ToLower(strings.TrimSpace(env)) {
@@ -763,56 +746,23 @@ func isMainnetEnvironment(env string) bool {
 
 func checkMainnetIssues(cfg *Config) []string {
 	const (
-		testnetNetwork    = "testnet"
-		testnetHorizon    = "https://horizon-testnet.stellar.org"
-		testnetSorobanRPC = "https://soroban-testnet.stellar.org"
-		testnetPassphrase = "Test SDF Network ; September 2015"
-		testnetUSDCIssuer = "GAX23V3WWDPPR5WRER3KTEUTDLSCGZYMSJY5FDRRKKCIQ4JADF5T27RC"
 		// Arc mainnet chain ID (docs.arc.io/arc/references/connect-to-arc).
-		// The config default chain_id 5042002 is the Arc testnet. Kept as a
-		// literal (not pkg/arc.ChainIDMainnet) so config stays dependency-free.
+		// The config default chain_id is 5042 (mainnet, no more testnet).
+		// Kept as a literal (not pkg/arc.ChainIDMainnet) so config stays
+		// dependency-free.
 		arcMainnetChainID = uint64(5042)
 	)
 
-	// Known testnet contract IDs (config/config.yaml "contracts" block). Any
-	// of these still configured in mainnet mode means cutover is incomplete.
-	// Mainnet IDs also start with "C", so only these exact values are flagged.
-	testnetContractIDs := map[string]bool{
-		"CADZWDGER6PYEWVHZDZ5HMEV6A5TKFVD4EY4DSPUTEKAM2KDPEABGJQU": true,
-		"CALNXOUPT267LRRUCIF6OICEVGVEVKH2D2SX3YURCB4JXLDOF5TXVPCN": true,
-		"CCEEJKQCYO7CXBFZBSGHS6AK2CCBU2HY2HK4VXQDPZ3XX3X3KEDGXQ7K": true,
-		"CDOBQSJZJD4RIE2V5Q2IOJ6PBPSE2FT46BCD5WXW64ZN4KEUMYGBX3CS": true,
-		"CASXVLHWI56BBKLZHDHCFMCXDWJ4XWEMZABVBUIQBPDHVK4UW6ICUSFI": true,
-	}
-
-	stellarMainnet := cfg.Stellar.Network == "mainnet"
 	envMainnet := isMainnetEnvironment(cfg.Environment)
-	if !stellarMainnet && !envMainnet {
+	if !envMainnet {
 		return nil
 	}
 
 	issues := []string{}
-	if stellarMainnet {
-		if cfg.Stellar.Network == testnetNetwork {
-			issues = append(issues, "network still set to testnet")
-		}
-		if cfg.Stellar.HorizonURL == testnetHorizon {
-			issues = append(issues, "horizon_url still set to testnet")
-		}
-		if cfg.Stellar.SorobanRPCURL == testnetSorobanRPC {
-			issues = append(issues, "soroban_rpc_url still set to testnet")
-		}
-		if cfg.Stellar.NetworkPassphrase == testnetPassphrase {
-			issues = append(issues, "network_passphrase still set to testnet")
-		}
-		if cfg.Stellar.USDCIssuer == testnetUSDCIssuer {
-			issues = append(issues, "usdc_issuer still set to testnet")
-		}
-	}
 
 	// Arc is the primary chain: a mainnet process must point at Arc mainnet
 	// (chain 5042) with an explicit RPC endpoint and USDC contract. The
-	// defaults are testnet-shaped (chain 5042002, empty rpc/usdc), so an
+	// defaults are mainnet-shaped (chain 5042, empty rpc/usdc), so an
 	// unconfigured mainnet deploy fails here instead of signing on the
 	// wrong chain.
 	if cfg.Arc.ChainID != arcMainnetChainID {
@@ -835,10 +785,13 @@ func checkMainnetIssues(cfg *Config) []string {
 		issues = append(issues, "keeper.escrow_address must be set when keeper.interval_minutes is non-zero in mainnet mode (set DEODES_KEEPER_ESCROW_ADDRESS, or set interval to 0 to disable the keeper)")
 	}
 
-	for name, id := range cfg.Contracts {
-		if testnetContractIDs[strings.TrimSpace(id)] {
-			issues = append(issues, fmt.Sprintf("contracts.%s still set to testnet value", name))
-		}
+	// Phase 0.6 freeze: the protocol-fee vault (arc.treasury_address) and the
+	// user-debit collector (keeper.escrow_address) must be separate keys.
+	// The V0 mainnet deployment used one EOA for both; commingling them means
+	// one compromised key drains fees and scheduled contributions together.
+	if escrow, treasury := strings.TrimSpace(cfg.Keeper.EscrowAddress), strings.TrimSpace(cfg.Arc.TreasuryAddress); escrow != "" && treasury != "" &&
+		strings.EqualFold(escrow, treasury) {
+		issues = append(issues, "keeper.escrow_address must differ from arc.treasury_address in mainnet mode (fee vault and debit collector must be separate keys; set DEODES_KEEPER_ESCROW_ADDRESS and DEODES_TREASURY_ADDRESS distinctly)")
 	}
 
 	if len(issues) == 0 {
@@ -865,7 +818,6 @@ func (c *Config) ValidateSecrets() error {
 		{"Auth.AdminAPIKey", c.Auth.AdminAPIKey},
 		{"Security.WalletPepper", c.Security.WalletPepper},
 		{"Security.EncryptionKey", c.Security.EncryptionKey},
-		{"Stellar.MasterSecretKey", c.Stellar.MasterSecretKey},
 		{"Redis.Password", c.Redis.Password},
 		{"Database.URL", c.Database.URL}, // credentials live in the DSN; there is no separate password field
 	}

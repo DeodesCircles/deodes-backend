@@ -1,0 +1,15 @@
+# 2026/10/14 17:51:41.313359 [TestSplitFee_Property_MirrorsFuzz] [rapid] draw pool: 45321
+# 2026/10/14 17:51:41.313495 [TestSplitFee_Property_MirrorsFuzz] 
+# 	Error Trace:	/root/deodes-backend/internal/domain/circle/distribution_test.go:95
+# 	            				/root/go/pkg/mod/pgregory.net/rapid@v1.3.0/engine.go:458
+# 	            				/root/go/pkg/mod/pgregory.net/rapid@v1.3.0/engine.go:467
+# 	            				/root/go/pkg/mod/pgregory.net/rapid@v1.3.0/engine.go:292
+# 	            				/root/go/pkg/mod/pgregory.net/rapid@v1.3.0/engine.go:207
+# 	            				/root/deodes-backend/internal/domain/circle/distribution_test.go:85
+# 	Error:      	"-3950" is not greater than or equal to "0"
+# 	Test:       	TestSplitFee_Property_MirrorsFuzz
+# 
+v0.4.8#7927631682324834617
+0x1bc1feb6dfd33f
+0x14c2d43f1ef0da
+0xb109

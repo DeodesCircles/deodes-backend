@@ -43,8 +43,8 @@ func TestEmailService_SendOTPSuccess(t *testing.T) {
 
 	svc := email.NewService(email.Config{
 		APIKey:      "test-brevo-key",
-		FromAddress: "support@moistello.com",
-		FromName:    "Moistello App",
+		FromAddress: "support@deodes.com",
+		FromName:    "Deodes App",
 		BaseURL:     server.URL,
 	})
 
@@ -55,8 +55,8 @@ func TestEmailService_SendOTPSuccess(t *testing.T) {
 	assert.Equal(t, "application/json", receivedHeaders.Get("Content-Type"))
 
 	sender := receivedBody["sender"].(map[string]any)
-	assert.Equal(t, "Moistello App", sender["name"])
-	assert.Equal(t, "support@moistello.com", sender["email"])
+	assert.Equal(t, "Deodes App", sender["name"])
+	assert.Equal(t, "support@deodes.com", sender["email"])
 
 	to := receivedBody["to"].([]any)
 	assert.Len(t, to, 1)

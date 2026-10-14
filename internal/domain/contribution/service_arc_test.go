@@ -19,7 +19,7 @@ const arcHash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 func TestContributionService_Record_RejectsNonPositiveAmount(t *testing.T) {
 	for _, amt := range []float64{0, -10} {
 		repo := new(contribMocks.Repository)
-		svc := contribution.NewService(repo, nil, nil, nil, "", nil)
+		svc := contribution.NewService(repo, nil, nil, nil)
 		_, err := svc.Record(context.Background(), contribution.RecordInput{
 			CircleID: uuid.New().String(), UserID: uuid.New().String(),
 			RoundNumber: 1, Amount: amt, TxnHash: arcHash,
@@ -31,7 +31,7 @@ func TestContributionService_Record_RejectsNonPositiveAmount(t *testing.T) {
 
 func TestContributionService_Record_RejectsBadRound(t *testing.T) {
 	repo := new(contribMocks.Repository)
-	svc := contribution.NewService(repo, nil, nil, nil, "", nil)
+	svc := contribution.NewService(repo, nil, nil, nil)
 	_, err := svc.Record(context.Background(), contribution.RecordInput{
 		CircleID: uuid.New().String(), UserID: uuid.New().String(),
 		RoundNumber: 0, Amount: 100, TxnHash: arcHash,
@@ -40,10 +40,9 @@ func TestContributionService_Record_RejectsBadRound(t *testing.T) {
 	repo.AssertNotCalled(t, "Create", mock.Anything, mock.Anything)
 }
 
-func TestContributionService_Record_ArcHashSkipsHorizon_Pending(t *testing.T) {
+func TestContributionService_Record_ArcHashPending(t *testing.T) {
 	repo := new(contribMocks.Repository)
-	horizon := new(mockHorizon)
-	svc := contribution.NewService(repo, nil, nil, horizon, "MASTER", nil)
+	svc := contribution.NewService(repo, nil, nil, nil)
 	ctx := context.Background()
 	repo.On("FindByTxnHash", ctx, arcHash).Return(nil, apperrors.ErrNotFound)
 	repo.On("Create", ctx, mock.MatchedBy(func(c *contribution.Contribution) bool {
@@ -56,6 +55,5 @@ func TestContributionService_Record_ArcHashSkipsHorizon_Pending(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, c)
 	assert.Equal(t, contribution.VerificationStatusPending, c.VerificationStatus)
-	horizon.AssertNotCalled(t, "VerifyTransaction", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	repo.AssertExpectations(t)
 }

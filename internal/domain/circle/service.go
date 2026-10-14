@@ -947,8 +947,25 @@ func (s *circleService) Exit(ctx context.Context, circleID, userID string) error
 	}
 
 	if c.Status == CircleStatusActive {
+		// Early exit forfeits the collateral share: contribution * collateral%.
+		// Recorded as an early_exit penalty row (2.7) instead of computed
+		// and dropped. Strikes do not apply to voluntary exits.
 		penalty := CalculateEarlyExitPenalty(c.TotalContributions, c.ContributionAmount*c.CollateralPercent/100.0, 0)
-		_ = penalty
+		if penalty > 0 {
+			if err := s.repo.CreatePenalty(ctx, &Penalty{
+				ID:             uuid.New(),
+				CircleID:       cid,
+				UserID:         uid,
+				RoundNumber:    c.CurrentRound,
+				PenaltyType:    PenaltyTypeEarlyExit,
+				Amount:         penalty,
+				StrikesApplied: 0,
+				Reason:         sql.NullString{String: "Early exit collateral forfeit", Valid: true},
+				CreatedAt:      time.Now().UTC(),
+			}); err != nil {
+				return fmt.Errorf("recording early-exit penalty: %w", err)
+			}
+		}
 	}
 
 	if err := s.repo.UpdateMemberStatus(ctx, cid, uid, MemberStatusExited); err != nil {
@@ -1291,40 +1308,103 @@ func (s *circleService) ProcessMissedContributions(ctx context.Context, circleID
 		if member.Status != MemberStatusActive {
 			continue
 		}
-		if !contributedMap[member.UserID] {
-			// Member missed contribution, apply penalty
-			penaltyAmt := CalculateLateFee(c.ContributionAmount, c.LateFeePercent)
-			strikes := ApplyStrikes(&member, "late") // default late penalty
-
-			p := &Penalty{
-				ID:             uuid.New(),
-				CircleID:       cID,
-				UserID:         member.UserID,
-				RoundNumber:    roundNumber,
-				PenaltyType:    PenaltyTypeLate,
-				Amount:         penaltyAmt,
-				StrikesApplied: strikes,
-				Reason:         sql.NullString{String: fmt.Sprintf("Missed contribution for round %d", roundNumber), Valid: true},
-				CreatedAt:      time.Now(),
+		if contributedMap[member.UserID] {
+			continue
+		}
+		// Grace window (2.7): a round's deadline is start + (round-1) *
+		// frequency; members inside deadline+grace are not yet late.
+		// Circles without a start date carry no schedule, so they
+		// fail open to immediate processing (pre-2.7 behavior).
+		if due, ok := roundDueDate(c, roundNumber); ok {
+			if time.Now().Before(due.Add(time.Duration(c.GracePeriodHours) * time.Hour)) {
+				continue
 			}
+		}
+		// Member missed contribution, apply penalty
+		penaltyAmt := CalculateLateFee(c.ContributionAmount, c.LateFeePercent)
+		member.Strikes += ApplyStrikes(&member, "late")
 
-			err = s.repo.CreatePenalty(ctx, p)
-			if err != nil {
-				return err
+		if err := s.repo.UpdateMemberStrikes(ctx, cID, member.UserID, member.Strikes); err != nil {
+			return fmt.Errorf("persisting strikes: %w", err)
+		}
+
+		penaltyType := PenaltyTypeLate
+		reason := fmt.Sprintf("Missed contribution for round %d", roundNumber)
+		// MaxStrikes is validated 1-10 at creation; a zero value (unset in
+		// tests/fixtures) disables removal rather than removing everyone.
+		if c.MaxStrikes > 0 && ShouldRemoveMember(member.Strikes, c.MaxStrikes) {
+			// Max strikes reached: remove the member and record the
+			// default. The penalty row below uses PenaltyTypeDefault.
+			if err := s.repo.UpdateMemberStatus(ctx, cID, member.UserID, MemberStatusRemoved); err != nil {
+				return fmt.Errorf("removing max-strike member: %w", err)
 			}
+			penaltyType = PenaltyTypeDefault
+			reason = fmt.Sprintf("Removed after %d strikes (missed round %d)", member.Strikes, roundNumber)
+		}
 
-			// Broadcast event for notification/indexer
-			// We can use a new method like MemberPenalized or just use existing ones.
-			// The Acceptance Criteria mentions: "Notify affected members"
-			// This will likely be handled by an event listener on the indexer or notification service.
-			// But for now, we process it here.
-			if s.broadcaster != nil {
-				s.broadcaster.MemberPenalized(ctx, circleID, member.UserID.String(), roundNumber, penaltyAmt)
+		p := &Penalty{
+			ID:             uuid.New(),
+			CircleID:       cID,
+			UserID:         member.UserID,
+			RoundNumber:    roundNumber,
+			PenaltyType:    penaltyType,
+			Amount:         penaltyAmt,
+			StrikesApplied: member.Strikes,
+			Reason:         sql.NullString{String: reason, Valid: true},
+			CreatedAt:      time.Now(),
+		}
+
+		err = s.repo.CreatePenalty(ctx, p)
+		if err != nil {
+			return err
+		}
+
+		// Broadcast event for notification/indexer
+		// We can use a new method like MemberPenalized or just use existing ones.
+		// The Acceptance Criteria mentions: "Notify affected members"
+		// This will likely be handled by an event listener on the indexer or notification service.
+		// But for now, we process it here.
+		if s.broadcaster != nil {
+			s.broadcaster.MemberPenalized(ctx, circleID, member.UserID.String(), roundNumber, penaltyAmt)
+			if penaltyType == PenaltyTypeDefault {
+				s.broadcaster.MemberLeft(ctx, circleID, member.UserID.String())
 			}
 		}
 	}
 
 	return nil
+}
+
+// frequencyDuration maps circle frequency to round spacing. Monthly is a
+// 30-day approximation (documented; exact calendar months need schedule
+// rows, which do not exist yet).
+func frequencyDuration(f CircleFrequency) (time.Duration, bool) {
+	switch f {
+	case FrequencyDaily:
+		return 24 * time.Hour, true
+	case FrequencyWeekly:
+		return 7 * 24 * time.Hour, true
+	case FrequencyBiweekly:
+		return 14 * 24 * time.Hour, true
+	case FrequencyMonthly:
+		return 30 * 24 * time.Hour, true
+	default:
+		return 0, false
+	}
+}
+
+// roundDueDate returns round N's contribution deadline: start + (N-1) *
+// frequency. False when the circle carries no start date or an unknown
+// frequency — callers fail open (no schedule to enforce).
+func roundDueDate(c *Circle, round int) (time.Time, bool) {
+	if c == nil || !c.StartDate.Valid || round < 1 {
+		return time.Time{}, false
+	}
+	step, ok := frequencyDuration(c.Frequency)
+	if !ok {
+		return time.Time{}, false
+	}
+	return c.StartDate.Time.Add(time.Duration(round-1) * step), true
 }
 
 func (s *circleService) snapshotRoundConfig(ctx context.Context, c *Circle, round int) error {

@@ -5,7 +5,7 @@ DURATION="${1:-3600}"  # seconds, default 1 hour
 INTERVAL="${2:-10}"     # seconds between iterations
 HEALTH_URL="${3:-http://localhost:1100/health}"
 
-echo "=== Moistello Soak Test ==="
+echo "=== Deodes Soak Test ==="
 echo "Duration: ${DURATION}s"
 echo "Interval: ${INTERVAL}s"
 echo "Health URL: ${HEALTH_URL}"
@@ -16,7 +16,7 @@ ITERATION=0
 HEALTH_OK=0
 HEALTH_FAIL=0
 
-log_file="/tmp/moistello-soak-$(date +%Y%m%d-%H%M%S).log"
+log_file="/tmp/deodes-soak-$(date +%Y%m%d-%H%M%S).log"
 echo "Logging to: $log_file"
 
 while true; do

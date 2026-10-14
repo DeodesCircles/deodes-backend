@@ -189,7 +189,7 @@ func TestWebhookIncoming_SignatureVerifiedWithHash(t *testing.T) {
 	w2 := httptest.NewRecorder()
 	req2, _ := http.NewRequest("POST", "/webhooks/incoming/"+webhookID, bytes.NewBuffer(payload))
 	req2.Header.Set("Content-Type", "application/json")
-	req2.Header.Set("X-Moistello-Signature", sig)
+	req2.Header.Set("X-Deodes-Signature", sig)
 	r.ServeHTTP(w2, req2)
 
 	assert.Equal(t, http.StatusOK, w2.Code, "valid signature should be accepted")
@@ -221,7 +221,7 @@ func TestWebhookIncoming_WrongSignatureRejected(t *testing.T) {
 	w2 := httptest.NewRecorder()
 	req2, _ := http.NewRequest("POST", "/webhooks/incoming/"+webhookID, bytes.NewBuffer(payload))
 	req2.Header.Set("Content-Type", "application/json")
-	req2.Header.Set("X-Moistello-Signature", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	req2.Header.Set("X-Deodes-Signature", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
 	r.ServeHTTP(w2, req2)
 
 	assert.Equal(t, http.StatusUnauthorized, w2.Code, "wrong signature must be rejected")

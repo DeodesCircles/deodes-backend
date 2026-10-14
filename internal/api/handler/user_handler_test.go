@@ -18,7 +18,7 @@ import (
 func TestUserHandler_ClaimName(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	h := handler.NewUserHandler(&fakeUserService{claimName: "@moistello_user"})
+	h := handler.NewUserHandler(&fakeUserService{claimName: "@deodes_user"})
 
 	r := gin.New()
 	r.POST("/v1/users/username/claim", h.ClaimName)

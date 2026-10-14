@@ -9,11 +9,11 @@ const docTemplate = `{
     "info": {
         "description": "{{escape .Description}}",
         "title": "{{.Title}}",
-        "termsOfService": "https://moistello.com/terms",
+        "termsOfService": "https://deodes.com/terms",
         "contact": {
-            "name": "Moistello Support",
-            "url": "https://moistello.com/support",
-            "email": "support@moistello.com"
+            "name": "Deodes Support",
+            "url": "https://deodes.com/support",
+            "email": "support@deodes.com"
         },
         "license": {
             "name": "MIT",
@@ -2509,11 +2509,11 @@ const docTemplate = `{
 // SwaggerInfo holds exported Swagger Info so clients can modify it
 var SwaggerInfo = &swag.Spec{
 	Version:          "1.0.0",
-	Host:             "moistello.com",
+	Host:             "deodes.com",
 	BasePath:         "/v1",
 	Schemes:          []string{"https"},
-	Title:            "Moistello API",
-	Description:      "Decentralized savings circles on Stellar. REST API for circles, contributions, payouts, reputation, and governance.",
+	Title:            "Deodes API",
+	Description:      "Decentralized savings circles on Arc. REST API for circles, contributions, payouts, reputation, and governance.",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 }

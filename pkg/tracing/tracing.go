@@ -20,7 +20,7 @@ import (
 const (
 	// instrumentationName is the tracer name used for all spans produced by
 	// this application.
-	instrumentationName = "moistello"
+	instrumentationName = "deodes"
 )
 
 var (
@@ -134,10 +134,10 @@ func StartRedisSpan(ctx context.Context, operation string) (context.Context, tra
 	)
 }
 
-// StartStellarSpan begins a child span for a Stellar Horizon/RPC operation.
-func StartStellarSpan(ctx context.Context, operation string) (context.Context, trace.Span) {
-	return StartSpan(ctx, "stellar."+operation,
-		attribute.String("rpc.system", "stellar"),
+// StartChainSpan begins a child span for an Arc chain RPC operation.
+func StartChainSpan(ctx context.Context, operation string) (context.Context, trace.Span) {
+	return StartSpan(ctx, "chain."+operation,
+		attribute.String("rpc.system", "arc"),
 		attribute.String("rpc.operation", operation),
 	)
 }

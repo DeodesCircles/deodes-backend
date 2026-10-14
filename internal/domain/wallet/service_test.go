@@ -12,7 +12,6 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/stellar/go/keypair"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -20,18 +19,34 @@ import (
 )
 
 // newTestService builds a wallet service for unit tests. DeriveWalletSeed does
-// not touch the repository or Horizon, so a nil repo and a throwaway master
-// keypair suffice.
+// not touch the repository or any chain, so a nil repo and empty config suffice.
 func newTestService(t *testing.T, cfg Config) Service {
 	t.Helper()
-	kp, err := keypair.Random()
-	require.NoError(t, err)
-	if cfg.MasterSecretKey == "" {
-		cfg.MasterSecretKey = kp.Seed()
-	}
 	svc, err := NewService(nil, cfg)
 	require.NoError(t, err)
 	return svc
+}
+
+// Purge program: construction needs no chain secrets, and legacy
+// (non-0x) wallets fail fast on balance reads instead of calling a
+// deleted chain client.
+func TestNewService_BootsWithoutChainSecrets(t *testing.T) {
+	svc, err := NewService(nil, Config{})
+	require.NoError(t, err)
+	require.NotNil(t, svc)
+}
+
+func TestGetBalance_LegacyWalletFailsFast(t *testing.T) {
+	repo := &stubRepo{wallets: []Wallet{{
+		ID: "w1", UserID: "u1",
+		PublicKey:  "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		WalletType: WalletTypeAuto, IsPrimary: true,
+	}}}
+	svc, err := NewService(repo, Config{})
+	require.NoError(t, err)
+	_, err = svc.GetBalance(context.Background(), "u1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "legacy wallet")
 }
 
 func TestDeriveWalletSeed_MissingPepper(t *testing.T) {
@@ -89,7 +104,7 @@ func TestDeriveWalletSeed_DefaultsWhenParamsZero(t *testing.T) {
 
 func TestCreateWallet_HexSeedMatchesRawSeed(t *testing.T) {
 	// Legacy callers pass []byte(hexString); the hex bug copied ASCII bytes.
-	// Both forms must now derive the same Stellar address.
+	// Both forms must now derive the same address.
 	svc := newTestService(t, Config{})
 	hexSeed := "81362d66c26500a3ffca1259323cfe1bc3b59658b65d6d534aaee0cb4eabf904"
 	raw, err := crypto.DecodeSeed32(hexSeed)
@@ -230,10 +245,7 @@ func newHostedWalletFixture(t *testing.T) Wallet {
 
 func newArcTestService(t *testing.T, rpcURL string, repo Repository) Service {
 	t.Helper()
-	kp, err := keypair.Random()
-	require.NoError(t, err)
 	svc, err := NewService(repo, Config{
-		MasterSecretKey: kp.Seed(),
 		EncryptionKey:   testEncKey,
 		ArcRPCURL:       rpcURL,
 		ArcChainID:      5042002,
@@ -346,9 +358,7 @@ func TestLinkWallet_RejectsInvalidAddress(t *testing.T) {
 
 func TestGetWalletByAddress_FoundMissingAndNilRepo(t *testing.T) {
 	linked := Wallet{ID: "w-link-1", UserID: "u1", PublicKey: "0x742d35cc6634c0532925a3b844bc454e4438f44e", WalletType: WalletTypeLinked}
-	kp, err := keypair.Random()
-	require.NoError(t, err)
-	svc, err := NewService(&stubRepo{wallets: []Wallet{linked}}, Config{MasterSecretKey: kp.Seed()})
+	svc, err := NewService(&stubRepo{wallets: []Wallet{linked}}, Config{})
 	require.NoError(t, err)
 
 	// Checksum-case lookup still finds the lowercase stored row.

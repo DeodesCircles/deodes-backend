@@ -1,6 +1,6 @@
-name: "moistello: Auto-Fix"
+name: "deodes: Auto-Fix"
 
-# The "moistello" bot auto-fixes ONLY its own mistakes:
+# The "deodes" bot auto-fixes ONLY its own mistakes:
 #   1. MERGE CONFLICTS on a PR that the BOT (opencode-agent[bot]) opened.
 #   2. FAILING CI on master/main caused by a mistaken bot merge, OR on a
 #      PR opened by the bot.
@@ -39,7 +39,7 @@ jobs:
         run: |
           AUTHOR="$(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }} --jq '.user.login')"
           echo "author=$AUTHOR"
-          if [ "$AUTHOR" = "opencode-agent[bot]" ] || [ "$AUTHOR" = "moistello-bot[bot]" ]; then
+          if [ "$AUTHOR" = "opencode-agent[bot]" ] || [ "$AUTHOR" = "deodes-bot[bot]" ]; then
             echo "bot_pr=true" >> "$GITHUB_OUTPUT"
             echo "Bot-owned PR — conflict resolution allowed."
           else
@@ -65,7 +65,7 @@ jobs:
         id: rebase
         if: steps.scope.outputs.bot_pr == 'true'
         run: |
-          git config user.name "moistello-bot[bot]"
+          git config user.name "deodes-bot[bot]"
           git config user.email "bot@users.noreply.github.com"
           if git rebase "origin/${{ github.event.pull_request.base.ref }}"; then
             echo "conflict=false" >> "$GITHUB_OUTPUT"
@@ -126,7 +126,7 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           OPENCODE_MODEL: ${{ secrets.OPENCODE_MODEL || 'opencode/mimo-v2.5-free' }}
         run: |
-          git config user.name "moistello-bot[bot]"
+          git config user.name "deodes-bot[bot]"
           git config user.email "bot@users.noreply.github.com"
 
           npm install -g opencode-ai 2>/dev/null || npx opencode --version >/dev/null 2>&1 || true
@@ -181,7 +181,7 @@ jobs:
           PR_JSON="$(gh pr list --repo "${{ github.repository }}" --head "$BRANCH" --json number,user --jq '.[0]' 2>/dev/null)"
           AUTHOR="$(echo "$PR_JSON" | jq -r '.user.login // ""')"
           echo "pr_author=$AUTHOR"
-          if [ "$AUTHOR" = "opencode-agent[bot]" ] || [ "$AUTHOR" = "moistello-bot[bot]" ]; then
+          if [ "$AUTHOR" = "opencode-agent[bot]" ] || [ "$AUTHOR" = "deodes-bot[bot]" ]; then
             echo "bot_introduced=true" >> "$GITHUB_OUTPUT"
             echo "Bot-owned PR ($AUTHOR) CI failure — proceeding."
           else
@@ -213,7 +213,7 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           OPENCODE_MODEL: ${{ secrets.OPENCODE_MODEL || 'opencode/mimo-v2.5-free' }}
         run: |
-          git config user.name "moistello-bot[bot]"
+          git config user.name "deodes-bot[bot]"
           git config user.email "bot@users.noreply.github.com"
           git checkout "${{ github.event.workflow_run.head_branch }}"
 
@@ -230,6 +230,6 @@ jobs:
             echo "No changes produced; nothing to push."
           else
             git add -A
-            git commit -m "fix(ci): automated fix for failing CI (moistello bot)" || echo "nothing to commit"
+            git commit -m "fix(ci): automated fix for failing CI (deodes bot)" || echo "nothing to commit"
             git push origin "HEAD:${{ github.event.workflow_run.head_branch }}"
           fi

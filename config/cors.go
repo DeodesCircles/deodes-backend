@@ -18,12 +18,14 @@ const (
 )
 
 // corsOriginsEnvVars are consulted, in order, for an explicit allowed-origins
-// override. MOISTELLO_CORS_ALLOWED_ORIGINS is the canonical name; the shorter
-// ALLOWED_ORIGINS is kept because it is what .env.example has always
+// override. DEODES_CORS_ALLOWED_ORIGINS is the canonical name (Phase 0.3
+// freeze); DEODES_CORS_ALLOWED_ORIGINS is accepted as a legacy fallback
+// and ALLOWED_ORIGINS last because it is what .env.example has always
 // documented. Precedence follows the rest of this package: the environment
 // beats the config file, which beats the per-environment default.
 var corsOriginsEnvVars = []string{
-	"MOISTELLO_CORS_ALLOWED_ORIGINS",
+	"DEODES_CORS_ALLOWED_ORIGINS",
+	"DEODES_CORS_ALLOWED_ORIGINS",
 	"ALLOWED_ORIGINS",
 }
 
@@ -48,9 +50,9 @@ func NormalizeEnvironment(environment string) string {
 func DefaultCORSOrigins(environment string) []string {
 	switch NormalizeEnvironment(environment) {
 	case EnvironmentProduction:
-		return []string{"https://app.moistello.io", "https://www.moistello.io"}
+		return []string{"https://app.deodes.com", "https://www.deodes.com", "https://deodes.com"}
 	case EnvironmentStaging:
-		return []string{"https://staging.moistello.io"}
+		return []string{"https://staging.deodes.com"}
 	default:
 		return []string{"http://localhost:1110", "http://127.0.0.1:1110"}
 	}

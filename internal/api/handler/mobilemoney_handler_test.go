@@ -33,7 +33,6 @@ type fakeMMService struct {
 	onrampFn func(ctx context.Context, userID string, req mobilemoney.OnrampRequest, key string) (*mobilemoney.Transaction, error)
 	getFn    func(ctx context.Context, id string) (*mobilemoney.Transaction, error)
 }
-
 func (f *fakeMMService) InitiateOnramp(ctx context.Context, userID string, req mobilemoney.OnrampRequest, key string) (*mobilemoney.Transaction, error) {
 	return f.onrampFn(ctx, userID, req, key)
 }
@@ -54,8 +53,44 @@ func (f *fakeMMService) GetSupportedCurrencies(ctx context.Context) []string {
 	return []string{"KES", "UGX"}
 }
 
+// mockMMWalletService is a minimal wallet.Service for mobile-money tests.
+type mockMMWalletService struct {
+	wallets []wallet.Wallet
+}
+
+func (m *mockMMWalletService) DeriveWalletSeed(ctx context.Context, email string) (string, error) {
+	return "mock-seed", nil
+}
+func (m *mockMMWalletService) CreateWallet(ctx context.Context, userID string, passkeySeed []byte) (*wallet.Wallet, error) {
+	return nil, nil
+}
+func (m *mockMMWalletService) CreateHostedArcWallet(ctx context.Context, userID string, passkeySeed []byte) (*wallet.Wallet, error) {
+	return nil, nil
+}
+func (m *mockMMWalletService) LinkWallet(ctx context.Context, userID, address string) (*wallet.Wallet, error) {
+	return nil, nil
+}
+func (m *mockMMWalletService) GetWalletByAddress(ctx context.Context, address string) (*wallet.Wallet, error) {
+	return nil, nil
+}
+func (m *mockMMWalletService) SignTransaction(ctx context.Context, walletID string, passkeySeed []byte, txnXDR string) (string, error) {
+	return "", nil
+}
+func (m *mockMMWalletService) GetWallets(ctx context.Context, userID string) ([]wallet.Wallet, error) {
+	return m.wallets, nil
+}
+func (m *mockMMWalletService) GetBalance(ctx context.Context, userID string) (*wallet.Balance, error) {
+	return nil, nil
+}
+func (m *mockMMWalletService) SendPayment(ctx context.Context, userID string, passkeySeed []byte, destination, asset string, amount float64, memo, ipAddress, userAgent string) (string, error) {
+	return "", nil
+}
+func (m *mockMMWalletService) DeleteWallet(ctx context.Context, userID, walletID string) error {
+	return nil
+}
+
 func TestMobileMoneyHandler_InitiateOnramp_RequiresIdempotencyKey(t *testing.T) {
-	mockWallet := &mockDepositWalletService{wallets: []wallet.Wallet{{PublicKey: "GABC"}}}
+	mockWallet := &mockMMWalletService{wallets: []wallet.Wallet{{PublicKey: "GABC"}}}
 	svc := &fakeMMService{}
 	r := setupMobileMoneyRouter(svc, mockWallet)
 
@@ -70,7 +105,7 @@ func TestMobileMoneyHandler_InitiateOnramp_RequiresIdempotencyKey(t *testing.T) 
 }
 
 func TestMobileMoneyHandler_InitiateOnramp_Success(t *testing.T) {
-	mockWallet := &mockDepositWalletService{wallets: []wallet.Wallet{{PublicKey: "GABC"}}}
+	mockWallet := &mockMMWalletService{wallets: []wallet.Wallet{{PublicKey: "GABC"}}}
 	svc := &fakeMMService{
 		onrampFn: func(ctx context.Context, userID string, req mobilemoney.OnrampRequest, key string) (*mobilemoney.Transaction, error) {
 			assert.Equal(t, "user-1", userID)
@@ -93,7 +128,7 @@ func TestMobileMoneyHandler_InitiateOnramp_Success(t *testing.T) {
 }
 
 func TestMobileMoneyHandler_InitiateOnramp_NoWallet(t *testing.T) {
-	mockWallet := &mockDepositWalletService{wallets: nil}
+	mockWallet := &mockMMWalletService{wallets: nil}
 	svc := &fakeMMService{}
 	r := setupMobileMoneyRouter(svc, mockWallet)
 
@@ -109,7 +144,7 @@ func TestMobileMoneyHandler_InitiateOnramp_NoWallet(t *testing.T) {
 }
 
 func TestMobileMoneyHandler_GetTransaction_HidesOtherUsersTransaction(t *testing.T) {
-	mockWallet := &mockDepositWalletService{}
+	mockWallet := &mockMMWalletService{}
 	svc := &fakeMMService{
 		getFn: func(ctx context.Context, id string) (*mobilemoney.Transaction, error) {
 			return &mobilemoney.Transaction{ID: id, UserID: "someone-else"}, nil
@@ -125,7 +160,7 @@ func TestMobileMoneyHandler_GetTransaction_HidesOtherUsersTransaction(t *testing
 }
 
 func TestMobileMoneyHandler_GetTransaction_NotFound(t *testing.T) {
-	mockWallet := &mockDepositWalletService{}
+	mockWallet := &mockMMWalletService{}
 	svc := &fakeMMService{
 		getFn: func(ctx context.Context, id string) (*mobilemoney.Transaction, error) {
 			return nil, apperrors.ErrNotFound
@@ -141,7 +176,7 @@ func TestMobileMoneyHandler_GetTransaction_NotFound(t *testing.T) {
 }
 
 func TestMobileMoneyHandler_ListProviders(t *testing.T) {
-	mockWallet := &mockDepositWalletService{}
+	mockWallet := &mockMMWalletService{}
 	svc := &fakeMMService{}
 	r := setupMobileMoneyRouter(svc, mockWallet)
 

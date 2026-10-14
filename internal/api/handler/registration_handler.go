@@ -235,7 +235,7 @@ func (h *RegistrationHandler) RegisterVerify(c *gin.Context) {
 		return
 	}
 
-	// Derive wallet seed and create wallets: legacy Stellar + hosted Arc 0x.
+	// Derive wallet seed and create wallets: Ed25519 watch wallet + hosted Arc 0x.
 	// Hosted Arc is canonical (Arc-only product) and returned so the
 	// frontend can display the auto-wallet immediately after signup.
 	var hostedAddress string

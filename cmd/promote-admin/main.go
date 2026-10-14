@@ -42,12 +42,12 @@ func main() {
 		"email of the existing user to promote (env ADMIN_EMAIL)")
 	force := flag.Bool("force", envFlag("ADMIN_PROMOTE_FORCE"),
 		"allow promoting when an admin already exists (env ADMIN_PROMOTE_FORCE=1)")
-	dbURL := flag.String("db-url", envOr("", "DEODES_DATABASE_URL", "MOISTELLO_DATABASE_URL", "DATABASE_URL"),
-		"postgres connection URL (env DEODES_DATABASE_URL, MOISTELLO_DATABASE_URL or DATABASE_URL)")
+	dbURL := flag.String("db-url", envOr("", "DEODES_DATABASE_URL", "DATABASE_URL"),
+		"postgres connection URL (env DEODES_DATABASE_URL, DEODES_DATABASE_URL or DATABASE_URL)")
 	flag.Parse()
 
 	if *dbURL == "" {
-		log.Fatal().Msg("missing database URL: pass --db-url or set DEODES_DATABASE_URL / MOISTELLO_DATABASE_URL / DATABASE_URL")
+		log.Fatal().Msg("missing database URL: pass --db-url or set DEODES_DATABASE_URL / DEODES_DATABASE_URL / DATABASE_URL")
 	}
 
 	opts := Options{Wallet: *wallet, Email: *email, Force: *force}

@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -27,15 +26,13 @@ type mobileMoneyChecker interface {
 }
 
 type HealthHandler struct {
-	db            *sql.DB
-	redis         *redis.Client
-	rabbit        rabbitChecker
-	mm            mobileMoneyChecker
-	sorobanRPCURL string
-	horizonURL    string
-	checkTimeout  time.Duration
-	httpClient    *http.Client
-	shuttingDown  atomic.Bool
+	db           *sql.DB
+	redis        *redis.Client
+	rabbit       rabbitChecker
+	mm           mobileMoneyChecker
+	checkTimeout time.Duration
+	httpClient   *http.Client
+	shuttingDown atomic.Bool
 }
 
 type DependencyStatus struct {
@@ -49,14 +46,12 @@ type HealthResponse struct {
 	Dependencies map[string]DependencyStatus `json:"dependencies"`
 }
 
-func NewHealthHandler(db *sql.DB, rds *redis.Client, sorobanRPCURL, horizonURL string) *HealthHandler {
+func NewHealthHandler(db *sql.DB, rds *redis.Client) *HealthHandler {
 	return &HealthHandler{
-		db:            db,
-		redis:         rds,
-		sorobanRPCURL: sorobanRPCURL,
-		horizonURL:    horizonURL,
-		checkTimeout:  5 * time.Second,
-		httpClient:    &http.Client{Timeout: 5 * time.Second},
+		db:           db,
+		redis:        rds,
+		checkTimeout: 5 * time.Second,
+		httpClient:   &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
@@ -93,7 +88,7 @@ func (h *HealthHandler) SetTimeout(d time.Duration) {
 }
 
 // @Summary Health check with dependency status
-// @Description Reports status of PostgreSQL, Redis, Stellar RPC, and Horizon dependencies.
+// @Description Reports status of PostgreSQL, Redis, and RabbitMQ dependencies.
 // @Tags Health
 // @Produce json
 // @Param timeout query string false "Timeout per check in seconds or duration (default 5s)"
@@ -130,21 +125,7 @@ func (h *HealthHandler) Health(c *gin.Context) {
 		hasFailure = true
 	}
 
-	// 3. Stellar RPC check
-	stellarRPCStatus := h.checkStellarRPC(timeout)
-	deps["stellar_rpc"] = stellarRPCStatus
-	if stellarRPCStatus.Status != "healthy" {
-		allHealthy = false
-	}
-
-	// 4. Horizon check
-	horizonStatus := h.checkHorizon(timeout)
-	deps["horizon"] = horizonStatus
-	if horizonStatus.Status != "healthy" {
-		allHealthy = false
-	}
-
-	// 5. RabbitMQ check
+	// 3. RabbitMQ check
 	rabbitmqStatus := h.checkRabbitMQ()
 	deps["rabbitmq"] = rabbitmqStatus
 	if rabbitmqStatus.Status != "healthy" {
@@ -152,7 +133,7 @@ func (h *HealthHandler) Health(c *gin.Context) {
 		hasFailure = true
 	}
 
-	// 6. Mobile Money provider presence
+	// 4. Mobile Money provider presence
 	if h.mm != nil {
 		deps["mobile_money"] = h.checkMobileMoney()
 	}
@@ -188,7 +169,7 @@ func (h *HealthHandler) Liveness(c *gin.Context) {
 }
 
 // @Summary Readiness check
-// @Description Reports readiness status of core dependencies (PostgreSQL, Redis, RabbitMQ, Stellar RPC, Horizon).
+// @Description Reports readiness status of core dependencies (PostgreSQL, Redis, RabbitMQ).
 // @Tags Health
 // @Produce json
 // @Success 200 {object} HealthResponse
@@ -222,18 +203,6 @@ func (h *HealthHandler) Readiness(c *gin.Context) {
 	rabbitmqStatus := h.checkRabbitMQ()
 	deps["rabbitmq"] = rabbitmqStatus
 	if rabbitmqStatus.Status != "healthy" {
-		allHealthy = false
-	}
-
-	stellarRPCStatus := h.checkStellarRPC(timeout)
-	deps["stellar_rpc"] = stellarRPCStatus
-	if stellarRPCStatus.Status != "healthy" {
-		allHealthy = false
-	}
-
-	horizonStatus := h.checkHorizon(timeout)
-	deps["horizon"] = horizonStatus
-	if horizonStatus.Status != "healthy" {
 		allHealthy = false
 	}
 
@@ -304,86 +273,6 @@ func (h *HealthHandler) checkRabbitMQ() DependencyStatus {
 	return DependencyStatus{Status: "healthy", Message: "connected"}
 }
 
-func (h *HealthHandler) checkStellarRPC(timeout time.Duration) DependencyStatus {
-	if h.sorobanRPCURL == "" {
-		return DependencyStatus{Status: "unhealthy", Message: "soroban_rpc_url not configured"}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	payload := []byte(`{"jsonrpc":"2.0","id":1,"method":"getHealth"}`)
-	req, err := http.NewRequestWithContext(ctx, "POST", h.sorobanRPCURL, bytes.NewBuffer(payload))
-	if err != nil {
-		return DependencyStatus{Status: "unhealthy", Message: fmt.Sprintf("failed to construct request: %v", err)}
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	start := time.Now()
-	resp, err := h.httpClient.Do(req)
-	latency := time.Since(start).Round(time.Microsecond)
-	if err != nil {
-		return DependencyStatus{
-			Status:  "unhealthy",
-			Latency: fmt.Sprintf("%v", latency),
-			Message: fmt.Sprintf("unreachable: %v", err),
-		}
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return DependencyStatus{
-			Status:  "unhealthy",
-			Latency: fmt.Sprintf("%v", latency),
-			Message: fmt.Sprintf("bad status code: %d", resp.StatusCode),
-		}
-	}
-
-	return DependencyStatus{
-		Status:  "healthy",
-		Latency: fmt.Sprintf("%v", latency),
-		Message: "reachable",
-	}
-}
-
-func (h *HealthHandler) checkHorizon(timeout time.Duration) DependencyStatus {
-	if h.horizonURL == "" {
-		return DependencyStatus{Status: "unhealthy", Message: "horizon_url not configured"}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", h.horizonURL, nil)
-	if err != nil {
-		return DependencyStatus{Status: "unhealthy", Message: fmt.Sprintf("failed to construct request: %v", err)}
-	}
-
-	start := time.Now()
-	resp, err := h.httpClient.Do(req)
-	latency := time.Since(start).Round(time.Microsecond)
-	if err != nil {
-		return DependencyStatus{
-			Status:  "unhealthy",
-			Latency: fmt.Sprintf("%v", latency),
-			Message: fmt.Sprintf("unreachable: %v", err),
-		}
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
-		return DependencyStatus{
-			Status:  "unhealthy",
-			Latency: fmt.Sprintf("%v", latency),
-			Message: fmt.Sprintf("bad status code: %d", resp.StatusCode),
-		}
-	}
-
-	return DependencyStatus{
-		Status:  "healthy",
-		Latency: fmt.Sprintf("%v", latency),
-		Message: "reachable",
-	}
-}
-
 // IndexerLag serves indexer lag metrics in JSON or Prometheus format.
 // @Summary Indexer lag metrics endpoint
 // @Description Returns current indexer ledger lag, queue depth, and processing rate
@@ -402,7 +291,7 @@ func (h *HealthHandler) IndexerLag(c *gin.Context) {
 	if c.GetHeader("Accept") == "text/plain" || c.Query("format") == "prometheus" {
 		c.Header("Content-Type", "text/plain; version=0.0.4")
 		c.String(http.StatusOK, fmt.Sprintf(
-			"# HELP moistello_indexer_ledger_lag Difference in ledgers/seconds from head\n# TYPE moistello_indexer_ledger_lag gauge\nmoistello_indexer_ledger_lag %d\n# HELP moistello_indexer_queue_depth Pending unprocessed events in queue\n# TYPE moistello_indexer_queue_depth gauge\nmoistello_indexer_queue_depth 0\n# HELP moistello_indexer_processing_rate Events processed per second\n# TYPE moistello_indexer_processing_rate gauge\nmoistello_indexer_processing_rate 10.00\n",
+			"# HELP deodes_indexer_ledger_lag Difference in ledgers/seconds from head\n# TYPE deodes_indexer_ledger_lag gauge\ndeodes_indexer_ledger_lag %d\n# HELP deodes_indexer_queue_depth Pending unprocessed events in queue\n# TYPE deodes_indexer_queue_depth gauge\ndeodes_indexer_queue_depth 0\n# HELP deodes_indexer_processing_rate Events processed per second\n# TYPE deodes_indexer_processing_rate gauge\ndeodes_indexer_processing_rate 10.00\n",
 			lagSeconds,
 		))
 		return

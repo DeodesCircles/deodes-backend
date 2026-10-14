@@ -2,9 +2,7 @@ package nonce
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"strconv"
@@ -12,7 +10,6 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/stellar/go/strkey"
 
 	"github.com/deodes/backend/pkg/apperrors"
 	"github.com/deodes/backend/pkg/arc"
@@ -106,43 +103,37 @@ func (s *service) Verify(ctx context.Context, walletAddress, signature string) (
 		}
 		valid := arc.SameSigner(recovered, walletAddress)
 		if valid {
-			// Atomically delete nonce on successful verification (single-use enforcement)
-			if err := s.redis.Del(ctx, key).Err(); err != nil {
-				// Set short expiry if deletion fails - nonce will expire naturally
+			// Atomically consume the nonce (single-use enforcement): delete
+			// only if it still holds the value read above. A lost race
+			// means a concurrent request consumed it first.
+			consumed, delErr := consumeNonce(ctx, s.redis, key, stored)
+			if delErr != nil {
+				// Fail safe: expire fast and reject — a replay must never
+				// succeed on infrastructure doubt.
 				_ = s.redis.Expire(ctx, key, 1*time.Second)
+				return false, fmt.Errorf("consuming nonce: %w", delErr)
+			}
+			if !consumed {
+				return false, apperrors.ErrNonceExpired
 			}
 		}
 		return valid, nil
 	}
 
-	sigBytes, err = hex.DecodeString(signature)
-	if err != nil {
-		return false, fmt.Errorf("decoding signature hex: %w", err)
-	}
-
-	publicKey, err := decodeStellarPublicKey(walletAddress)
-	if err != nil {
-		return false, fmt.Errorf("decoding public key: %w", err)
-	}
-
-	message := sha256.Sum256([]byte(nonceStr))
-	valid := ed25519.Verify(publicKey, message[:], sigBytes)
-
-	if valid {
-		// Atomically delete nonce on successful verification (single-use enforcement)
-		if err := s.redis.Del(ctx, key).Err(); err != nil {
-			// Set short expiry if deletion fails - nonce will expire naturally
-			_ = s.redis.Expire(ctx, key, 1*time.Second)
-		}
-	}
-
-	return valid, nil
+	return false, fmt.Errorf("unsupported signature: want 65-byte EIP-191 personal_sign for a 0x address")
 }
 
-func decodeStellarPublicKey(address string) (ed25519.PublicKey, error) {
-	raw, err := strkey.Decode(strkey.VersionByteAccountID, address)
+// consumeNonce deletes key only if it still equals expected, atomically
+// (Lua compare-and-del). True means this caller consumed the single use.
+func consumeNonce(ctx context.Context, rdb *redis.Client, key, expected string) (bool, error) {
+	n, err := redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+else
+  return 0
+end`).Run(ctx, rdb, []string{key}, expected).Int()
 	if err != nil {
-		return nil, fmt.Errorf("decoding stellar address: %w", err)
+		return false, err
 	}
-	return ed25519.PublicKey(raw), nil
+	return n == 1, nil
 }

@@ -1,13 +1,13 @@
-// @title Moistello API
+// @title Deodes API
 // @version 1.0.0
-// @description Decentralized savings circles on Stellar. REST API for circles, contributions, payouts, reputation, and governance.
-// @termsOfService https://moistello.com/terms
-// @contact.name Moistello Support
-// @contact.email support@moistello.com
-// @contact.url https://moistello.com/support
+// @description Decentralized savings circles on Arc. REST API for circles, contributions, payouts, reputation, and governance.
+// @termsOfService https://deodes.com/terms
+// @contact.name Deodes Support
+// @contact.email support@deodes.com
+// @contact.url https://deodes.com/support
 // @license.name MIT
 // @license.url https://opensource.org/licenses/MIT
-// @host moistello.com
+// @host deodes.com
 // @BasePath /v1
 // @schemes https
 // @securityDefinitions.apikey BearerAuth
@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/deodes/backend/config"
@@ -47,20 +48,18 @@ import (
 	"github.com/deodes/backend/internal/domain/sms"
 	"github.com/deodes/backend/internal/domain/subscription"
 	"github.com/deodes/backend/internal/domain/swap"
-	"github.com/deodes/backend/internal/domain/token"
 	"github.com/deodes/backend/internal/domain/totp"
 	"github.com/deodes/backend/internal/domain/user"
 	"github.com/deodes/backend/internal/domain/verification"
 	"github.com/deodes/backend/internal/domain/wallet"
 	"github.com/deodes/backend/internal/indexer"
 	ws "github.com/deodes/backend/internal/websocket"
+	"github.com/deodes/backend/pkg/arc"
 	"github.com/deodes/backend/pkg/jobqueue"
 	"github.com/deodes/backend/pkg/logger"
 	"github.com/deodes/backend/pkg/postgres"
 	"github.com/deodes/backend/pkg/rabbitmq"
 	"github.com/deodes/backend/pkg/redis"
-	"github.com/deodes/backend/pkg/stellar"
-	"github.com/deodes/backend/pkg/stellar/soroban"
 	"github.com/deodes/backend/pkg/tracing"
 	"github.com/deodes/backend/pkg/validator"
 	"github.com/deodes/backend/webhook"
@@ -81,7 +80,7 @@ func (a *moiAdapter) FindByID(ctx context.Context, id uuid.UUID) (*circle.UserMO
 }
 
 // payoutWalletAdapter satisfies payout.WalletLookup by resolving a user's
-// on-chain Stellar wallet address from the user repository.
+// on-chain wallet address from the user repository.
 type payoutWalletAdapter struct {
 	repo user.Repository
 }
@@ -150,16 +149,16 @@ func (a *digestPreferenceAdapter) DigestPreferences(ctx context.Context, userID 
 }
 
 // governanceWeightResolver computes a voter's governance weight for the
-// creation-time snapshot (#418): their governance-token balance scaled by
-// their reputation tier factor.
+// creation-time snapshot (#418): reputation tier factor over a baseline of 1.
+// (Token-balance scaling returns with the Arc token in Phase 2.11; until
+// then every voter counts at their reputation tier, never zero.)
 //
 // It lives here rather than in the governance package so governance does not
-// import the token, reputation and user domains — the same adapter pattern used
+// import the reputation and user domains — the same adapter pattern used
 // by userLookupAdapter and digestPreferenceAdapter above.
 type governanceWeightResolver struct {
 	users      user.Repository
 	reputation reputation.Repository
-	tokens     token.Service
 }
 
 func (r *governanceWeightResolver) VotingWeight(ctx context.Context, userID string) (int64, error) {
@@ -167,8 +166,7 @@ func (r *governanceWeightResolver) VotingWeight(ctx context.Context, userID stri
 	if err != nil {
 		return 0, err
 	}
-	u, err := r.users.FindByID(ctx, uid)
-	if err != nil {
+	if _, err := r.users.FindByID(ctx, uid); err != nil {
 		return 0, err
 	}
 
@@ -179,17 +177,7 @@ func (r *governanceWeightResolver) VotingWeight(ctx context.Context, userID stri
 		tier = snapshot.Level
 	}
 
-	if r.tokens == nil || u.WalletAddress == "" {
-		// Without a token service (or address) there is no balance to weight,
-		// so fall back to the reputation-scaled baseline of 1.
-		return governance.ApplyTierFactor(1, tier), nil
-	}
-
-	balance, err := r.tokens.GetBalance(ctx, u.WalletAddress)
-	if err != nil {
-		return 0, err
-	}
-	return governance.ApplyTierFactor(int64(balance), tier), nil
+	return governance.ApplyTierFactor(1, tier), nil
 }
 
 // EligibleVoters returns every active user's id, so the snapshot covers anyone
@@ -258,7 +246,7 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to initialize tracing")
 	}
 
-	log.Info().Msg("starting Moistello API server")
+	log.Info().Msg("starting Deodes API server")
 
 	db, err := postgres.New(cfg.Database)
 	if err != nil {
@@ -274,7 +262,7 @@ func main() {
 	}
 
 	// Detect connection leaks and pool exhaustion; alerts are logged and counted
-	// in moistello_db_pool_alerts_total.
+	// in deodes_db_pool_alerts_total.
 	poolMonitorCtx, stopPoolMonitor := context.WithCancel(context.Background())
 	poolMonitor := postgres.NewPoolMonitor(db, postgres.PoolMonitorOptions{}, func(a postgres.PoolAlert) {
 		log.Warn().Str("kind", a.Kind).Str("detail", a.Detail).Msg("db pool alert")
@@ -303,11 +291,62 @@ func main() {
 		Broadcaster:      wsBroadcaster,
 		Transactor:       circle.NewTransactor(db),
 	})
-	// Stellar client used for on-chain verification
-	horizonClient := stellar.NewClient(cfg.Stellar.HorizonURL, cfg.Stellar.SorobanRPCURL, cfg.Stellar.NetworkPassphrase)
+	contribSvc := contribution.NewService(contribRepo, wsBroadcaster, contribution.NewTransactor(db), circleSvc)
+	payoutSvc := payout.NewService(payoutRepo, &payoutWalletAdapter{repo: userRepo}, circleSvc)
+	// Phase 2.5: Contribute/TriggerPayout resolve against the configured
+	// circle contract. Wiring fails boot on a malformed address (the
+	// config-load shape check already rejects typos; this is the
+	// defense-in-depth service-side pin).
+	if cwc, ok := contribSvc.(contribution.ServiceWithCircle); ok {
+		if err := cwc.SetArcCircleAddress(cfg.Arc.CircleAddress); err != nil {
+			log.Fatal().Err(err).Msg("invalid arc.circle_address for contribution service")
+		}
+	}
+	if pwc, ok := payoutSvc.(payout.ServiceWithCircle); ok {
+		if err := pwc.SetArcCircleAddress(cfg.Arc.CircleAddress); err != nil {
+			log.Fatal().Err(err).Msg("invalid arc.circle_address for payout service")
+		}
+	}
 
-	contribSvc := contribution.NewService(contribRepo, wsBroadcaster, contribution.NewTransactor(db), horizonClient, cfg.Stellar.MasterPublicKey, circleSvc)
-	payoutSvc := payout.NewService(payoutRepo, horizonClient, &payoutWalletAdapter{repo: userRepo}, circleSvc)
+	// Phase 2.6: Arc event indexer. Tails DeodesCircle logs (backfill +
+	// live), settles on-chain verification, and fans out WS chain events.
+	// Disabled when no RPC URL or no circle is configured (dev default):
+	// the API serves everything else normally.
+	if strings.TrimSpace(cfg.Arc.RPCURL) != "" && strings.TrimSpace(cfg.Arc.CircleAddress) != "" {
+		arcClient := arc.NewClient(cfg.Arc.RPCURL, cfg.Arc.ChainID)
+		batchBlocks := uint64(cfg.Indexer.BatchSize)
+		if batchBlocks == 0 {
+			batchBlocks = 50
+		}
+		reorgWindow := uint64(cfg.Indexer.ReorgWindow)
+		if cfg.Indexer.ReorgWindow < 0 {
+			reorgWindow = 10
+		}
+		arcPoller := indexer.NewPoller(
+			arcClient,
+			indexer.NewRepository(db),
+			contribRepo,
+			payoutRepo,
+			circleRepo,
+			wsBroadcaster,
+			indexer.Config{
+				ChainID:           cfg.Arc.ChainID,
+				Addresses:         []string{cfg.Arc.CircleAddress},
+				StartBlock:        cfg.Indexer.StartBlock,
+				BatchBlocks:       batchBlocks,
+				MaxBatchesPerTick: 20,
+				ReorgWindow:       reorgWindow,
+				PollInterval:      cfg.Indexer.PollInterval,
+			},
+		)
+		go arcPoller.Run(context.Background())
+		log.Info().
+			Str("circle", cfg.Arc.CircleAddress).
+			Uint64("chain_id", cfg.Arc.ChainID).
+			Msg("arc indexer started")
+	} else {
+		log.Info().Msg("arc indexer disabled (arc.rpc_url or arc.circle_address unset)")
+	}
 	reputationSvc := reputation.NewService(reputationRepo)
 	authSvc, err := auth.NewServiceWithKeyConfig(redisClient, cfg.Auth.NonceTTL, cfg.Auth.AccessTokenTTL, cfg.Auth.RefreshTokenTTL, auth.KeyConfig{
 		CurrentPrivateKeyPEM:  cfg.Auth.JWTPrivateKeyPEM,
@@ -371,12 +410,6 @@ func main() {
 
 	// Wallet service (needed before auth handler for wallet creation)
 	walletCfg := wallet.Config{
-		MasterSecretKey:   cfg.Stellar.MasterSecretKey,
-		MasterPublicKey:   cfg.Stellar.MasterPublicKey,
-		HorizonURL:        cfg.Stellar.HorizonURL,
-		USDCIssuer:        cfg.Stellar.USDCIssuer,
-		NetworkPassphrase: cfg.Stellar.NetworkPassphrase,
-		MinBalanceXLM:     cfg.Stellar.WalletMinBalance,
 		// Deterministic seed derivation for email-based wallets (#166).
 		WalletPepper:  cfg.Security.WalletPepper,
 		Argon2Time:    cfg.Security.Argon2Time,
@@ -393,17 +426,6 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize wallet service")
 	}
-
-	tokenSvc, err := token.NewService(wallet.NewRepository(db), token.Config{
-		GovernanceTokenContractID: cfg.Stellar.GovernanceTokenContractID,
-		SorobanRPCURL:             cfg.Stellar.SorobanRPCURL,
-		NetworkPassphrase:         cfg.Stellar.NetworkPassphrase,
-		HorizonURL:                cfg.Stellar.HorizonURL,
-	})
-	if err != nil {
-		log.Fatal().Err(err).Msg("failed to initialize token service")
-	}
-	tokenH := handler.NewTokenHandler(tokenSvc)
 
 	jwtPublicKey := []byte(cfg.Auth.JWTPublicKeyPEM)
 
@@ -431,7 +453,7 @@ func main() {
 	adminH := handler.NewAdminHandler(userSvc, userRepo, circleSvc, auditRepo, adminSvc, featureFlagSvc, featureFlagCache)
 	webhookRepo := webhook.NewPostgresRepository(db.DB)
 	webhookH := handler.NewWebhookHandler(webhookRepo)
-	healthH := handler.NewHealthHandler(db.DB, redisClient, cfg.Stellar.SorobanRPCURL, cfg.Stellar.HorizonURL)
+	healthH := handler.NewHealthHandler(db.DB, redisClient)
 	passkeyCredH := handler.NewPasskeyCredentialHandler(db)
 	walletH := handler.NewWalletHandler(walletSvc, authSvc)
 
@@ -526,17 +548,11 @@ func main() {
 	savingsSvc := savings.NewService(savingsRepo)
 	savingsH := handler.NewSavingsGoalHandler(savingsSvc)
 
-	// Initialize Soroban client for escrow swap contract
-	sorobanClient := soroban.NewClient(cfg.Stellar.SorobanRPCURL)
-	signer, err := stellar.NewSigner(cfg.Stellar.MasterSecretKey)
-	if err != nil {
-		log.Fatal().Err(err).Msg("failed to create stellar signer")
-	}
-	accountMgr := stellar.NewAccountManager(horizonClient, cfg.Stellar.MasterPublicKey)
-
-	// Create escrow swap contract invoker and client
-	escrowSwapInvoker := soroban.NewContractInvoker(sorobanClient, signer, accountMgr, cfg.Stellar.EscrowSwapContractID)
-	escrowSwapClient := soroban.NewEscrowSwapClient(escrowSwapInvoker)
+	// Swap escrow is on-chain (purged): no escrow client exists, so
+	// the swap service gets an untyped nil and fails fast per call
+	// (requireEscrow) instead of failing at boot. Arc escrow arrives with
+	// the 2.x swap rework; off-chain offer records work meanwhile.
+	var escrowSwapClient swap.EscrowClient
 
 	// Swap service and handler
 	swapRepo := swap.NewPostgresRepository(db)
@@ -563,7 +579,11 @@ func main() {
 		Contrib:       contribSvc,
 		Circles:       circleSvc,
 		EscrowAddress: cfg.Keeper.EscrowAddress,
-		Notifier:      keeperNotifier,
+		// Phase 0.6 freeze: protocol-fee vault and debit collector must be
+		// separate keys. Equal values fail here (fail-closed) instead of
+		// commingling fees with user debits.
+		TreasuryAddress: cfg.Arc.TreasuryAddress,
+		Notifier:        keeperNotifier,
 		OnEvent: func(ctx context.Context, e subscription.DebitEvent) {
 			log.Info().
 				Str("subscription", e.SubscriptionID).
@@ -607,7 +627,7 @@ func main() {
 	// pre-#414 immediate execution.
 	governanceSvc := governance.NewService(governanceRepo,
 		governance.WithWeightResolver(
-			&governanceWeightResolver{users: userRepo, reputation: reputationRepo, tokens: tokenSvc},
+			&governanceWeightResolver{users: userRepo, reputation: reputationRepo},
 		),
 		governance.WithTimelock(governance.TimelockConfig{
 			Delay:              cfg.Governance.ExecutionTimelock,
@@ -642,9 +662,8 @@ func main() {
 	// Job queue for background tasks
 	jobQueue := jobqueue.NewJobQueue(db)
 	adminJobQueueH := handler.NewAdminJobQueueHandler(jobQueue)
-	adminIndexerH := handler.NewAdminIndexerHandler(indexer.NewDeadLetterStore(db))
 
-	router := api.NewRouter(cfg, redisClient, authH, userH, circleH, contribH, payoutH, inviteH, notifH, adminH, webhookH, healthH, passkeyCredH, walletH, mobileMoneyH, chatH, communityH, wsH, savingsH, tokenH, swapH, governanceH, reputationH, referralH, consentH, subscriptionH, adminJobQueueH, adminIndexerH, webhookRepo, jwtPublicKey)
+	router := api.NewRouter(cfg, redisClient, authH, userH, circleH, contribH, payoutH, inviteH, notifH, adminH, webhookH, healthH, passkeyCredH, walletH, mobileMoneyH, chatH, communityH, wsH, savingsH, swapH, governanceH, reputationH, referralH, consentH, subscriptionH, adminJobQueueH, webhookRepo, jwtPublicKey)
 
 	// Shutdown order: fail readiness first so the load balancer stops sending
 	// traffic, drain in-flight HTTP requests (bounded by

@@ -111,7 +111,7 @@ func TestWalletHandler_Withdraw_MemoAndLabel(t *testing.T) {
 	t.Run("over-long memo is rejected before sending", func(t *testing.T) {
 		svc := new(mockWalletService)
 		p := base()
-		p["memo"] = "this memo is far too long for stellar"
+		p["memo"] = "this memo is far too long for the memo cap"
 
 		w := post(svc, p)
 

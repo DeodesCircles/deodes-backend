@@ -89,7 +89,10 @@ func TestCircleService_Create_TooFewMembers(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.Nil(t, c)
-	assert.Equal(t, circle.ErrParticipantLimit, err)
+	// Too few members is both the legacy participant-limit sentinel and a
+	// validation failure (400 VALIDATION_ERROR, never 500).
+	assert.ErrorIs(t, err, circle.ErrParticipantLimit)
+	assert.ErrorIs(t, err, apperrors.ErrInvalidInput)
 }
 
 func TestCircleService_Create_MemberCreationFails(t *testing.T) {
@@ -126,7 +129,7 @@ func TestCircleService_Join_Success(t *testing.T) {
 
 	c := &circle.Circle{
 		ID: uuid.MustParse(cid), Name: "Test", Status: circle.CircleStatusActive,
-		MaxMembers: 10, CircleType: circle.CircleTypePublic,
+		MaxMembers: 10, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC,
 	}
 	repo.On("FindByID", ctx, mock.AnythingOfType("uuid.UUID")).Return(c, nil)
 	repo.On("GetMemberCount", ctx, mock.AnythingOfType("uuid.UUID")).Return(3, nil)
@@ -148,7 +151,7 @@ func TestCircleService_Join_Full(t *testing.T) {
 
 	c := &circle.Circle{
 		ID: uuid.MustParse(cid), Name: "Test", Status: circle.CircleStatusActive,
-		MaxMembers: 5, CircleType: circle.CircleTypePublic,
+		MaxMembers: 5, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC,
 	}
 	repo.On("FindByID", ctx, mock.AnythingOfType("uuid.UUID")).Return(c, nil)
 	repo.On("GetMemberCount", ctx, mock.AnythingOfType("uuid.UUID")).Return(5, nil)
@@ -169,7 +172,7 @@ func TestCircleService_Join_AlreadyMember(t *testing.T) {
 
 	c := &circle.Circle{
 		ID: uuid.MustParse(cid), Name: "Test", Status: circle.CircleStatusActive,
-		MaxMembers: 10, CircleType: circle.CircleTypePublic,
+		MaxMembers: 10, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC,
 	}
 	existingMember := &circle.CircleMember{
 		CircleID: uuid.MustParse(cid), UserID: uuid.MustParse(uid),
@@ -195,7 +198,7 @@ func TestCircleService_Join_PrivateWithoutInvite(t *testing.T) {
 
 	c := &circle.Circle{
 		ID: uuid.MustParse(cid), Name: "Private", Status: circle.CircleStatusActive,
-		MaxMembers: 10, CircleType: circle.CircleTypePrivate,
+		MaxMembers: 10, CircleType: circle.CircleTypePrivate, Currency: circle.CurrencyUSDC,
 	}
 	repo.On("FindByID", ctx, mock.AnythingOfType("uuid.UUID")).Return(c, nil)
 
@@ -203,6 +206,128 @@ func TestCircleService_Join_PrivateWithoutInvite(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.Equal(t, circle.ErrInvalidInvite, err)
+	repo.AssertExpectations(t)
+}
+
+// stubMOIRepo is a minimal UserMOIFetcher for join score-gate tests.
+type stubMOIRepo struct {
+	score int
+	err   error
+}
+
+func (s *stubMOIRepo) FindByID(_ context.Context, _ uuid.UUID) (*circle.UserMOIData, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &circle.UserMOIData{MoiScore: s.score}, nil
+}
+
+func TestCircleService_Join_MinMoiScoreTooLow(t *testing.T) {
+	repo := new(circleMocks.Repository)
+	svc := circle.NewService(repo, &stubMOIRepo{score: 20}, circle.Dependencies{})
+	ctx := context.Background()
+	cid := uuid.New().String()
+	uid := uuid.New().String()
+
+	c := &circle.Circle{
+		ID: uuid.MustParse(cid), Name: "Gated", Status: circle.CircleStatusPending,
+		MaxMembers: 10, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC,
+		MinMoiScore: 100,
+	}
+	repo.On("FindByID", ctx, mock.AnythingOfType("uuid.UUID")).Return(c, nil)
+
+	err := svc.Join(ctx, cid, uid, "")
+
+	assert.ErrorIs(t, err, circle.ErrMoiScoreTooLow)
+	repo.AssertExpectations(t)
+}
+
+func TestCircleService_Join_MinMoiScoreMet(t *testing.T) {
+	repo := new(circleMocks.Repository)
+	svc := circle.NewService(repo, &stubMOIRepo{score: 150}, circle.Dependencies{})
+	ctx := context.Background()
+	cid := uuid.New().String()
+	uid := uuid.New().String()
+
+	c := &circle.Circle{
+		ID: uuid.MustParse(cid), Name: "Gated", Status: circle.CircleStatusPending,
+		MaxMembers: 10, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC,
+		MinMoiScore: 100,
+	}
+	repo.On("FindByID", ctx, mock.AnythingOfType("uuid.UUID")).Return(c, nil)
+	repo.On("GetMemberCount", ctx, mock.AnythingOfType("uuid.UUID")).Return(1, nil)
+	repo.On("FindMemberByCircleAndUser", ctx, mock.AnythingOfType("uuid.UUID"), mock.AnythingOfType("uuid.UUID")).Return(nil, apperrors.ErrNotFound)
+	repo.On("CreateMember", ctx, mock.AnythingOfType("*circle.CircleMember")).Return(nil)
+
+	err := svc.Join(ctx, cid, uid, "")
+
+	assert.NoError(t, err)
+	repo.AssertExpectations(t)
+}
+
+func TestCircleService_Join_LegacyRailRejected(t *testing.T) {
+	repo := new(circleMocks.Repository)
+	svc := circle.NewService(repo, nil, circle.Dependencies{})
+	ctx := context.Background()
+	cid := uuid.New().String()
+	uid := uuid.New().String()
+
+	c := &circle.Circle{
+		ID: uuid.MustParse(cid), Name: "Legacy", Status: circle.CircleStatusActive,
+		MaxMembers: 10, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyXLM,
+	}
+	repo.On("FindByID", ctx, mock.AnythingOfType("uuid.UUID")).Return(c, nil)
+
+	err := svc.Join(ctx, cid, uid, "")
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "only USDC")
+	repo.AssertExpectations(t)
+}
+
+func TestCircleService_Join_EndedCircleRejected(t *testing.T) {
+	repo := new(circleMocks.Repository)
+	svc := circle.NewService(repo, nil, circle.Dependencies{})
+	ctx := context.Background()
+	cid := uuid.New().String()
+	uid := uuid.New().String()
+
+	for _, status := range []circle.CircleStatus{circle.CircleStatusCompleted, circle.CircleStatusCancelled} {
+		c := &circle.Circle{
+			ID: uuid.MustParse(cid), Name: "Done", Status: status,
+			MaxMembers: 10, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC,
+		}
+		repo.On("FindByID", ctx, mock.AnythingOfType("uuid.UUID")).Return(c, nil).Once()
+
+		err := svc.Join(ctx, cid, uid, "")
+
+		assert.ErrorIs(t, err, circle.ErrCircleNotActive, "status %s", status)
+	}
+	repo.AssertExpectations(t)
+}
+
+func TestCircleService_Join_ReactivatesExitedMember(t *testing.T) {
+	repo := new(circleMocks.Repository)
+	svc := circle.NewService(repo, nil, circle.Dependencies{})
+	ctx := context.Background()
+	cid := uuid.New()
+	uid := uuid.New()
+
+	c := &circle.Circle{
+		ID: cid, Name: "Test", Status: circle.CircleStatusPending,
+		MaxMembers: 10, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC,
+	}
+	exited := &circle.CircleMember{
+		CircleID: cid, UserID: uid, Status: circle.MemberStatusExited,
+	}
+	repo.On("FindByID", ctx, cid).Return(c, nil)
+	repo.On("GetMemberCount", ctx, cid).Return(3, nil)
+	repo.On("FindMemberByCircleAndUser", ctx, cid, uid).Return(exited, nil)
+	repo.On("UpdateMemberStatus", ctx, cid, uid, circle.MemberStatusActive).Return(nil)
+
+	err := svc.Join(ctx, cid.String(), uid.String(), "")
+
+	assert.NoError(t, err)
 	repo.AssertExpectations(t)
 }
 
@@ -397,6 +522,7 @@ func TestCircleService_ProcessMissedContributions(t *testing.T) {
 	repo.On("FindByID", ctx, cid).Return(c, nil)
 	repo.On("GetMembers", ctx, cid).Return(members, nil)
 	repo.On("GetContributionsByCircleAndRound", ctx, cid, roundNumber).Return(contributions, nil)
+	repo.On("UpdateMemberStrikes", ctx, cid, user2, 1).Return(nil)
 
 	// Expected penalty for user2
 	repo.On("CreatePenalty", ctx, mock.MatchedBy(func(p *circle.Penalty) bool {

@@ -4,13 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/deodes/backend/internal/domain/circle"
 	"github.com/deodes/backend/pkg/apperrors"
+	"github.com/deodes/backend/pkg/arc"
 	"github.com/deodes/backend/pkg/metrics"
-	"github.com/deodes/backend/pkg/money"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 )
 
@@ -26,20 +27,13 @@ type RecordInput struct {
 	FeeAmount   float64    `json:"feeAmount" validate:"gte=0"`
 	TxnHash     string     `json:"txnHash" validate:"required"`
 	PayoutType  PayoutType `json:"payoutType" validate:"required,oneof=random fixed auction vote"`
-	// Optional overrides — used by the indexer / tests to set verification
-	// state directly without going through the Horizon check.
+	// Optional overrides — used by tests to set verification
+	// state directly without on-chain verification.
 	VerifiedOnchain    *bool
 	VerificationStatus *VerificationStatus
 }
 
-// HorizonVerifier is satisfied by *stellar.Client.
-type HorizonVerifier interface {
-	// VerifyPayment checks that txnHash exists, was successful, and has a
-	// payment TO expectedTo for expectedAmount.
-	VerifyPayment(ctx context.Context, txnHash, expectedTo, expectedAmount string) (bool, error)
-}
-
-// WalletLookup resolves a user's on-chain Stellar wallet address by their UUID.
+// WalletLookup resolves a user's on-chain wallet address by their UUID.
 // Implemented in main.go by a thin shim over user.Repository to avoid a
 // direct dependency on the user domain.
 type WalletLookup interface {
@@ -64,26 +58,55 @@ type Service interface {
 type ServiceWithCircle interface {
 	Service
 	SetCircleService(circleService circle.Service)
+	// SetArcCircleAddress pins the configured DeodesCircle contract (2.5).
+	// Empty clears it (chain checks dormant). A malformed address is
+	// rejected here so a typo fails wiring, not a live payout.
+	SetArcCircleAddress(addr string) error
+	// SetTxVerifier wires record-time on-chain verification (2.8, parked).
+	// Nil clears it (pending semantics, indexer settles later).
+	SetTxVerifier(v TxVerifier)
 }
+
+// TxVerifier is the minimal Arc receipt surface for record-time on-chain
+// verification (2.8). *arc.Client satisfies it; tests stub it.
+type TxVerifier interface {
+	GetTransactionReceipt(ctx context.Context, txHash string) (*arc.Receipt, error)
+}
+
+type verifyOutcome int
+
+const (
+	// verifyUnknown leaves the record pending: RPC flake or not-yet-mined.
+	// The 2.6 indexer settles it later.
+	verifyUnknown verifyOutcome = iota
+	verifyConfirmed
+	verifyFailed
+)
 
 type service struct {
 	repo          Repository
-	horizon       HorizonVerifier
 	walletLookup  WalletLookup
 	circleService circle.Service
+	// arcCircleAddress is cfg.Arc.CircleAddress: the canonical circle
+	// contract Record resolves against. Empty means unwired (dev).
+	arcCircleAddress string
+	// verifier, when set, settles on-chain verification at record time
+	// (2.8). Nil keeps pending semantics; the indexer settles later.
+	verifier TxVerifier
 }
 
-// NewService constructs the payout service.
+// NewService constructs the payout service. On-chain verification is the Arc
+// indexer's job (2.6): hashes record as pending unless the caller supplies
+// an explicit verification state.
 //
-//	horizon      – may be nil (on-chain verification skipped; useful in tests)
 //	walletLookup – may be nil (recipient wallet check skipped)
 //	circleSvc    – circle service for membership/round validity checks
 //
-// The third parameter is typed as interface{} so that callers can pass a
+// The second parameter is typed as interface{} so that callers can pass a
 // concrete *user.pgRepo (which satisfies WalletLookup when wrapped) or nil.
 // If it already satisfies WalletLookup it is used directly; otherwise it is
 // ignored.
-func NewService(repo Repository, horizon HorizonVerifier, walletLookup interface{}, circleSvc circle.Service) Service {
+func NewService(repo Repository, walletLookup interface{}, circleSvc circle.Service) Service {
 	var wl WalletLookup
 	if walletLookup != nil {
 		if v, ok := walletLookup.(WalletLookup); ok {
@@ -94,7 +117,6 @@ func NewService(repo Repository, horizon HorizonVerifier, walletLookup interface
 	}
 	return &service{
 		repo:          repo,
-		horizon:       horizon,
 		walletLookup:  wl,
 		circleService: circleSvc,
 	}
@@ -156,6 +178,12 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Payout, error
 			return nil, fmt.Errorf("getting circle: %w", err)
 		}
 
+		// Phase 2.5: the payout must resolve against the configured
+		// circle contract — a circle bound elsewhere is the wrong rail.
+		if _, err := s.resolveCircleContract(cir); err != nil {
+			return nil, err
+		}
+
 		// OnTime is true only if the round number is valid (1 <= round <= current round)
 		isOnTime = isOnTime && input.RoundNumber <= cir.CurrentRound
 	}
@@ -176,7 +204,10 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Payout, error
 		}
 	}
 
-	// Determine verification state — caller may override (e.g. indexer).
+	// Determine verification state — caller may override. Hashes record as
+	// pending for the Arc indexer (2.6), which settles on-chain verification.
+	// Phase 2.8: when a TxVerifier is wired (production), a live receipt
+	// check settles immediately instead of waiting for the indexer.
 	verifiedOnchain := false
 	verificationStatus := VerificationStatusUnverified
 
@@ -187,35 +218,8 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Payout, error
 		verificationStatus = *input.VerificationStatus
 	}
 
-	// On-chain verification: only run when horizon is available and the caller
-	// has not already provided an explicit verification state.
-	if s.horizon != nil && input.TxnHash != "" &&
-		input.VerifiedOnchain == nil && input.VerificationStatus == nil {
-
-		recipientWallet, walletErr := s.resolveRecipientWallet(ctx, recipientUID)
-		if walletErr != nil {
-			// Cannot resolve wallet — record as pending for async retry.
-			log.Warn().Err(walletErr).Str("recipient_id", input.RecipientID).
-				Msg("could not resolve recipient wallet; recording payout as pending")
-			verificationStatus = VerificationStatusPending
-		} else {
-			amount, amtErr := money.FromFloat64(input.Amount)
-			if amtErr != nil {
-				return nil, fmt.Errorf("invalid payout amount: %w", amtErr)
-			}
-			ok, verErr := s.horizon.VerifyPayment(ctx, input.TxnHash, recipientWallet, amount.String())
-			if verErr != nil {
-				log.Warn().Err(verErr).Str("txn_hash", input.TxnHash).
-					Msg("horizon verification failed; recording payout as pending")
-				verificationStatus = VerificationStatusPending
-			} else if !ok {
-				metrics.PayoutsTotal.WithLabelValues("rejected", "", "").Inc()
-				return nil, fmt.Errorf("on-chain verification failed: txnHash %s does not match recipient/amount", input.TxnHash)
-			} else {
-				verifiedOnchain = true
-				verificationStatus = VerificationStatusVerified
-			}
-		}
+	if input.TxnHash != "" && input.VerifiedOnchain == nil && input.VerificationStatus == nil {
+		verificationStatus = VerificationStatusPending
 	}
 
 	// Guard against duplicate payouts in the same circle/round. A ROSCA round
@@ -262,13 +266,6 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Payout, error
 	metrics.PayoutsTotal.WithLabelValues("success", "", "").Inc()
 	metrics.PayoutVolumeTotal.WithLabelValues("").Add(input.Amount)
 	return p, nil
-}
-
-func (s *service) resolveRecipientWallet(ctx context.Context, recipientUID uuid.UUID) (string, error) {
-	if s.walletLookup == nil {
-		return "", fmt.Errorf("no wallet lookup available")
-	}
-	return s.walletLookup.WalletAddressForUser(ctx, recipientUID)
 }
 
 // circlePaidRecipients returns the set of user IDs that have received at
@@ -337,4 +334,44 @@ func (s *service) UpdateVerification(ctx context.Context, id string, verifiedOnc
 // SetCircleService sets the circle service for membership/round validity checks.
 func (s *service) SetCircleService(cs circle.Service) {
 	s.circleService = cs
+}
+
+// SetTxVerifier wires record-time on-chain verification (2.8, parked:
+// stored but not yet consulted by Record).
+func (s *service) SetTxVerifier(v TxVerifier) {
+	s.verifier = v
+}
+
+// SetArcCircleAddress pins the configured circle contract (2.5 wiring).
+func (s *service) SetArcCircleAddress(addr string) error {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		s.arcCircleAddress = ""
+		return nil
+	}
+	if err := arc.ValidateAddress(addr); err != nil {
+		return fmt.Errorf("payout: invalid arc circle address: %w", err)
+	}
+	s.arcCircleAddress = addr
+	return nil
+}
+
+// resolveCircleContract returns the on-chain contract a payout for cir must
+// have touched: the circle's own contract_id when set, else the configured
+// circle. A circle bound to a DIFFERENT contract than configured is rejected
+// (wrong circle/rail) rather than recorded against the wrong address.
+func (s *service) resolveCircleContract(cir *circle.Circle) (string, error) {
+	configured := s.arcCircleAddress
+	own := ""
+	if cir != nil && cir.ContractID.Valid {
+		own = strings.TrimSpace(cir.ContractID.String)
+	}
+	if own != "" && configured != "" && !strings.EqualFold(own, configured) {
+		return "", fmt.Errorf("%w: circle %s is bound to %s, configured circle is %s",
+			apperrors.ErrCircleContractMismatch, cir.ID, own, configured)
+	}
+	if own != "" {
+		return own, nil
+	}
+	return configured, nil
 }

@@ -26,9 +26,10 @@ Because the token is tied to a session, CSRF can only be enforced on **authentic
 | Route | Why it is exempt |
 |---|---|
 | `POST /webhooks/incoming/:id` | Server-to-server webhook, verified by the handler |
-| `POST /webhooks/yellowcard` | Server-to-server provider webhook, signature-verified by the handler |
 | `POST /v1/auth/register` | Creates the session, so no CSRF token can exist yet |
 | `POST /v1/auth/register/verify` | Creates the session |
+| `POST /v1/auth/login` | Creates the session from credentials; no ambient session to ride (Phase 2.2) |
+| `POST /v1/auth/google` | Creates the session from an ID token; no ambient session to ride (Phase 2.2) |
 | `POST /v1/auth/refresh` | Exchanges a refresh token for a new session |
 | `POST /v1/auth/nonce` | Pre-auth wallet challenge |
 | `POST /v1/auth/verify` | Pre-auth wallet signature login; creates the session |

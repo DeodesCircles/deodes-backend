@@ -27,7 +27,7 @@ func TestContributionService_Record_RejectsEndedCircle(t *testing.T) {
 	for _, status := range []circle.CircleStatus{circle.CircleStatusCompleted, circle.CircleStatusCancelled} {
 		t.Run(string(status), func(t *testing.T) {
 			repo := new(contribMocks.Repository)
-			svc := contribution.NewService(repo, nil, nil, nil, "", statusCircleService{status: status})
+			svc := contribution.NewService(repo, nil, nil, statusCircleService{status: status})
 
 			c, err := svc.Record(context.Background(), contribution.RecordInput{
 				CircleID:    uuid.New().String(),

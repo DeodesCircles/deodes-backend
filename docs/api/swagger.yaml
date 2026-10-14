@@ -162,19 +162,19 @@ definitions:
       preferredLanguage:
         type: string
     type: object
-host: moistello.com
+host: deodes.com
 info:
   contact:
-    email: support@moistello.com
-    name: Moistello Support
-    url: https://moistello.com/support
-  description: Decentralized savings circles on Stellar. REST API for circles, contributions,
+    email: support@deodes.com
+    name: Deodes Support
+    url: https://deodes.com/support
+  description: Decentralized savings circles on Arc. REST API for circles, contributions,
     payouts, reputation, and governance.
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT
-  termsOfService: https://moistello.com/terms
-  title: Moistello API
+  termsOfService: https://deodes.com/terms
+  title: Deodes API
   version: 1.0.0
 paths:
   /admin/audit-log:

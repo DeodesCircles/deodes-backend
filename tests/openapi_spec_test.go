@@ -73,7 +73,6 @@ func TestOpenAPISpec_RouteCoverage(t *testing.T) {
 
 		// Public webhooks
 		{path: "/webhooks/incoming/{id}", method: "POST"},
-		{path: "/webhooks/yellowcard", method: "POST"},
 
 		// WebSocket
 		{path: "/ws", method: "GET"},

@@ -42,6 +42,16 @@ func NewService(repo Repository, circleSvc CircleService, userSvc UserService, e
 	}
 }
 
+// requireEscrow fails fast when no on-chain escrow client exists (purged
+// rail). Without this, the first on-chain swap call would nil-panic
+// instead of returning a mappable error.
+func (s *Service) requireEscrow() error {
+	if s.escrow == nil {
+		return apperrors.ErrChainDisabled
+	}
+	return nil
+}
+
 func (s *Service) CreateSwapOffer(ctx context.Context, userID string, input SwapOfferRequest) (*SwapOffer, error) {
 	u, err := s.userSvc.GetByID(ctx, userID)
 	if err != nil {
@@ -61,6 +71,9 @@ func (s *Service) CreateSwapOffer(ctx context.Context, userID string, input Swap
 		offereeWallet = offereeUser.WalletAddress
 	}
 
+	if err := s.requireEscrow(); err != nil {
+		return nil, err
+	}
 	_, err = s.escrow.CreateSwap(
 		ctx,
 		input.CircleID,
@@ -121,6 +134,12 @@ func (s *Service) AcceptSwapOffer(ctx context.Context, userID string, offerID st
 		return nil, apperrors.ErrNotFound
 	}
 
+	// Static precondition: fail before claiming, so a disabled rail never
+	// leaves an offer stuck mid-transition.
+	if err := s.requireEscrow(); err != nil {
+		return nil, err
+	}
+
 	swapped, err := s.repo.CompareAndSwapStatus(ctx, offerID, SwapOfferStatusCreated, SwapOfferStatusAccepted, nil)
 	if err != nil {
 		return nil, err
@@ -162,6 +181,9 @@ func (s *Service) CancelSwapOffer(ctx context.Context, userID string, offerID st
 		return nil, apperrors.ErrNotFound
 	}
 
+	if err := s.requireEscrow(); err != nil {
+		return nil, err
+	}
 	txHash, err := s.escrow.CancelSwap(ctx, offerID, userObj.WalletAddress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to cancel swap on-chain: %w", err)
@@ -235,6 +257,13 @@ func (s *Service) releaseExpiredOffer(ctx context.Context, offerID, offerorUserI
 		return err
 	}
 
+	// Disabled rail: release is on-chain only, so there is nothing to do —
+	// but the claim must be given back for a later tick (same policy as an
+	// unresolvable offeror above).
+	if err := s.requireEscrow(); err != nil {
+		log.Warn().Err(err).Str("offerID", offerID).Msg("swap sweep: escrow unavailable, claim released")
+		return err
+	}
 	txHash, err := s.escrow.CancelSwap(ctx, offerID, offeror.WalletAddress)
 	if err != nil {
 		log.Warn().Err(err).Str("offerID", offerID).Msg("swap sweep: on-chain cancel failed")

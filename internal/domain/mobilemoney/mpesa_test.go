@@ -20,7 +20,7 @@ func newTestMPesaProvider(t *testing.T, handler http.HandlerFunc) (*mobilemoney.
 		ConsumerSecret:  "secret",
 		Shortcode:       "174379",
 		Passkey:         "passkey",
-		CallbackBaseURL: "https://api.moistello.com",
+		CallbackBaseURL: "https://api.deodes.com",
 		Sandbox:         true,
 	})
 	p.SetBaseURL(srv.URL)

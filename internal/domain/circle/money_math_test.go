@@ -10,7 +10,7 @@ import (
 	"github.com/deodes/backend/pkg/money"
 )
 
-func TestPayoutPool_ExactInStroops(t *testing.T) {
+func TestPayoutPool_ExactInMinor(t *testing.T) {
 	pool, err := PayoutPool(money.MustFromString("0.1"), 3, money.MustFromString("0.0000001"))
 	require.NoError(t, err)
 	assert.Equal(t, "0.3000001", pool.String())
@@ -20,14 +20,14 @@ func TestPayoutPool_ExactInStroops(t *testing.T) {
 	assert.Equal(t, 0.0, CalculatePayout(math.NaN(), 3, 1, 0))
 }
 
-func TestLateFee_RoundsToNearestStroop(t *testing.T) {
+func TestLateFee_RoundsToNearestMinor(t *testing.T) {
 	fee, err := LateFee(money.MustFromString("100"), 2.5)
 	require.NoError(t, err)
 	assert.Equal(t, "2.5000000", fee.String())
 
 	fee, err = LateFee(money.MustFromString("0.0000001"), 50)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), fee.Stroops(), "half a stroop rounds away from zero")
+	assert.Equal(t, int64(1), fee.Minor(), "half a minor unit rounds away from zero")
 
 	assert.Equal(t, 2.5, CalculateLateFee(100, 2.5))
 	assert.Equal(t, 0.0, CalculateLateFee(math.Inf(1), 2.5))

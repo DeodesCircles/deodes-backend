@@ -2,7 +2,7 @@ package circle
 
 import "github.com/deodes/backend/pkg/money"
 
-// LateFee returns lateFeePercent of the contribution, rounded to the nearest stroop.
+// LateFee returns lateFeePercent of the contribution, rounded to the nearest minor unit.
 func LateFee(contribution money.Money, lateFeePercent float64) (money.Money, error) {
 	return contribution.Percent(lateFeePercent)
 }

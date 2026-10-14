@@ -91,7 +91,7 @@ func TestResponse_EnvelopeContract(t *testing.T) {
 		assert.Equal(t, 400, env.Status)
 		assert.Equal(t, "Bad Request", env.Title)
 		assert.Equal(t, "invalid input", env.Detail)
-		assert.Equal(t, "https://moistello.com/probs/bad-request", env.Type)
+		assert.Equal(t, "https://deodes.com/probs/bad-request", env.Type)
 		assert.Equal(t, "/test-err", env.Instance)
 	})
 
@@ -109,7 +109,7 @@ func TestResponse_EnvelopeContract(t *testing.T) {
 		assert.Equal(t, 401, env.Status)
 		assert.Equal(t, "Unauthorized", env.Title)
 		assert.Equal(t, "invalid email or signature", env.Detail)
-		assert.Equal(t, "https://moistello.com/probs/invalid-credentials", env.Type)
+		assert.Equal(t, "https://deodes.com/probs/invalid-credentials", env.Type)
 	})
 
 	t.Run("Nonce expired error response with stable code and problem details", func(t *testing.T) {
@@ -123,6 +123,6 @@ func TestResponse_EnvelopeContract(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, env.Success)
 		assert.Equal(t, "NONCE_EXPIRED", env.Code)
-		assert.Equal(t, "https://moistello.com/probs/nonce-expired", env.Type)
+		assert.Equal(t, "https://deodes.com/probs/nonce-expired", env.Type)
 	})
 }

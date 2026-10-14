@@ -13,7 +13,7 @@ import (
 	"github.com/deodes/backend/pkg/apperrors"
 )
 
-// Envelope represents both the legacy Moistello API response wrapper and
+// Envelope represents both the legacy Deodes API response wrapper and
 // RFC 9457 Problem Details object for error responses.
 type Envelope struct {
 	Success   bool   `json:"success"`
@@ -123,7 +123,7 @@ func problemTypeURI(code string) string {
 		return "about:blank"
 	}
 	slug := strings.ToLower(strings.ReplaceAll(code, "_", "-"))
-	return fmt.Sprintf("https://moistello.com/probs/%s", slug)
+	return fmt.Sprintf("https://deodes.com/probs/%s", slug)
 }
 
 func OK(c *gin.Context, data any) {

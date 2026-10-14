@@ -126,7 +126,7 @@ func TestDispatchPayload_DetachedBackgroundContext(t *testing.T) {
 		time.Sleep(30 * time.Millisecond) // slight delay
 		body, _ := io.ReadAll(r.Body)
 		received <- body
-		receivedSig <- r.Header.Get("X-Moistello-Signature")
+		receivedSig <- r.Header.Get("X-Deodes-Signature")
 		receivedReqID <- r.Header.Get("X-Request-ID")
 		w.WriteHeader(http.StatusOK)
 	}))

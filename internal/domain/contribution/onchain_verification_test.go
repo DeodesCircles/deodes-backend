@@ -3,7 +3,6 @@ package contribution_test
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -16,22 +15,17 @@ import (
 	"github.com/deodes/backend/pkg/apperrors"
 )
 
-// mockHorizon is a test double for contribution.HorizonVerifier.
-type mockHorizon struct{ mock.Mock }
-
-func (m *mockHorizon) VerifyTransaction(ctx context.Context, txnHash, from, amount string) (bool, error) {
-	args := m.Called(ctx, txnHash, from, amount)
-	return args.Bool(0), args.Error(1)
-}
+// Post-purge semantics (no chain client): a txnHash without explicit
+// overrides records as Pending for the Arc indexer (2.6); explicit caller
+// states always win; replays stay idempotent.
 
 // --------------------------------------------------------------------------
-// Happy-path: horizon confirms the transaction
+// Default: txnHash records as pending
 // --------------------------------------------------------------------------
 
-func TestContributionService_Record_VerifiesOnChain_Success(t *testing.T) {
+func TestContributionService_Record_PendingByDefault(t *testing.T) {
 	repo := new(contribMocks.Repository)
-	horizon := new(mockHorizon)
-	svc := contribution.NewService(repo, nil, nil, horizon, "MASTER_PUBLIC_KEY", nil)
+	svc := contribution.NewService(repo, nil, nil, nil)
 	ctx := context.Background()
 
 	input := contribution.RecordInput{
@@ -39,41 +33,35 @@ func TestContributionService_Record_VerifiesOnChain_Success(t *testing.T) {
 		UserID:      uuid.New().String(),
 		RoundNumber: 1,
 		Amount:      100.0,
-		TxnHash:     "valid-txn-hash-001",
+		TxnHash:     "0xabc123",
 	}
 
 	// No prior record for this hash.
-	repo.On("FindByTxnHash", ctx, "valid-txn-hash-001").Return(nil, apperrors.ErrNotFound)
-	// Horizon confirms the transaction.
-	horizon.On("VerifyTransaction", ctx, "valid-txn-hash-001", "MASTER_PUBLIC_KEY", "100.0000000").Return(true, nil)
-	// Record is persisted as verified.
+	repo.On("FindByTxnHash", ctx, "0xabc123").Return(nil, apperrors.ErrNotFound)
+	// Record is persisted as pending.
 	repo.On("Create", ctx, mock.MatchedBy(func(c *contribution.Contribution) bool {
-		return c.VerifiedOnchain == true &&
-			c.VerificationStatus == contribution.VerificationStatusVerified &&
-			c.Status == contribution.StatusConfirmed &&
-			c.TxnHash.String == "valid-txn-hash-001"
+		return c.VerifiedOnchain == false &&
+			c.VerificationStatus == contribution.VerificationStatusPending &&
+			c.TxnHash.String == "0xabc123"
 	})).Return(nil)
 
 	c, err := svc.Record(ctx, input)
 
 	require.NoError(t, err)
 	require.NotNil(t, c)
-	assert.True(t, c.VerifiedOnchain, "contribution must be marked verified_onchain=true")
-	assert.Equal(t, contribution.VerificationStatusVerified, c.VerificationStatus)
-	assert.Equal(t, contribution.StatusConfirmed, c.Status)
+	assert.False(t, c.VerifiedOnchain, "contribution must not be marked verified without indexer confirmation")
+	assert.Equal(t, contribution.VerificationStatusPending, c.VerificationStatus)
 
 	repo.AssertExpectations(t)
-	horizon.AssertExpectations(t)
 }
 
 // --------------------------------------------------------------------------
-// Security: mismatched txnHash must be rejected
+// Non-0x hashes record as pending too (never rejected without a verifier)
 // --------------------------------------------------------------------------
 
-func TestContributionService_Record_RejectsOnChainMismatch(t *testing.T) {
+func TestContributionService_Record_NonArcHashPendingNotRejected(t *testing.T) {
 	repo := new(contribMocks.Repository)
-	horizon := new(mockHorizon)
-	svc := contribution.NewService(repo, nil, nil, horizon, "MASTER_PUBLIC_KEY", nil)
+	svc := contribution.NewService(repo, nil, nil, nil)
 	ctx := context.Background()
 
 	input := contribution.RecordInput{
@@ -85,18 +73,18 @@ func TestContributionService_Record_RejectsOnChainMismatch(t *testing.T) {
 	}
 
 	repo.On("FindByTxnHash", ctx, "forged-txn-hash").Return(nil, apperrors.ErrNotFound)
-	// Horizon says the transaction does NOT match sender/amount.
-	horizon.On("VerifyTransaction", ctx, "forged-txn-hash", "MASTER_PUBLIC_KEY", "500.0000000").Return(false, nil)
+	repo.On("Create", ctx, mock.MatchedBy(func(c *contribution.Contribution) bool {
+		return c.VerificationStatus == contribution.VerificationStatusPending &&
+			c.VerifiedOnchain == false
+	})).Return(nil)
 
 	c, err := svc.Record(ctx, input)
 
-	assert.Error(t, err, "mismatched txnHash must return an error")
-	assert.Nil(t, c)
-	assert.Contains(t, err.Error(), "on-chain verification failed")
+	require.NoError(t, err, "without a verifier nothing may be rejected on-chain grounds")
+	require.NotNil(t, c)
+	assert.Equal(t, contribution.VerificationStatusPending, c.VerificationStatus)
 
-	repo.AssertNotCalled(t, "Create", mock.Anything, mock.Anything)
 	repo.AssertExpectations(t)
-	horizon.AssertExpectations(t)
 }
 
 // --------------------------------------------------------------------------
@@ -105,8 +93,7 @@ func TestContributionService_Record_RejectsOnChainMismatch(t *testing.T) {
 
 func TestContributionService_Record_IdempotentOnReplay(t *testing.T) {
 	repo := new(contribMocks.Repository)
-	horizon := new(mockHorizon)
-	svc := contribution.NewService(repo, nil, nil, horizon, "MASTER_PUBLIC_KEY", nil)
+	svc := contribution.NewService(repo, nil, nil, nil)
 	ctx := context.Background()
 
 	existing := &contribution.Contribution{
@@ -135,59 +122,17 @@ func TestContributionService_Record_IdempotentOnReplay(t *testing.T) {
 	require.NotNil(t, c)
 	assert.Equal(t, existing.ID, c.ID, "must return the existing record")
 
-	// Horizon must NOT be called and no new DB row must be created.
-	horizon.AssertNotCalled(t, "VerifyTransaction", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	repo.AssertNotCalled(t, "Create", mock.Anything, mock.Anything)
 	repo.AssertExpectations(t)
 }
 
 // --------------------------------------------------------------------------
-// Horizon unavailable: record as pending (soft failure)
-// --------------------------------------------------------------------------
-
-func TestContributionService_Record_PendingWhenHorizonUnavailable(t *testing.T) {
-	repo := new(contribMocks.Repository)
-	horizon := new(mockHorizon)
-	svc := contribution.NewService(repo, nil, nil, horizon, "MASTER_PUBLIC_KEY", nil)
-	ctx := context.Background()
-
-	input := contribution.RecordInput{
-		CircleID:    uuid.New().String(),
-		UserID:      uuid.New().String(),
-		RoundNumber: 1,
-		Amount:      75.0,
-		TxnHash:     "offline-txn-hash",
-	}
-
-	repo.On("FindByTxnHash", ctx, "offline-txn-hash").Return(nil, apperrors.ErrNotFound)
-	// Horizon returns a transient network error.
-	horizon.On("VerifyTransaction", ctx, "offline-txn-hash", "MASTER_PUBLIC_KEY", "75.0000000").
-		Return(false, errors.New("connection refused"))
-	// Record is still persisted but marked as pending verification.
-	repo.On("Create", ctx, mock.MatchedBy(func(c *contribution.Contribution) bool {
-		return c.VerificationStatus == contribution.VerificationStatusPending &&
-			c.VerifiedOnchain == false
-	})).Return(nil)
-
-	c, err := svc.Record(ctx, input)
-
-	require.NoError(t, err)
-	require.NotNil(t, c)
-	assert.False(t, c.VerifiedOnchain)
-	assert.Equal(t, contribution.VerificationStatusPending, c.VerificationStatus)
-
-	repo.AssertExpectations(t)
-	horizon.AssertExpectations(t)
-}
-
-// --------------------------------------------------------------------------
-// No horizon client — caller-supplied verification state is used (indexer path)
+// Caller-supplied verification state is used (indexer path)
 // --------------------------------------------------------------------------
 
 func TestContributionService_Record_UsesCallerVerificationState(t *testing.T) {
 	repo := new(contribMocks.Repository)
-	// No horizon client — verification state comes from caller.
-	svc := contribution.NewService(repo, nil, nil, nil, "", nil)
+	svc := contribution.NewService(repo, nil, nil, nil)
 	ctx := context.Background()
 
 	verified := true
@@ -223,7 +168,7 @@ func TestContributionService_Record_UsesCallerVerificationState(t *testing.T) {
 
 func TestContributionService_Record_HandlesCreateConflict(t *testing.T) {
 	repo := new(contribMocks.Repository)
-	svc := contribution.NewService(repo, nil, nil, nil, "", nil)
+	svc := contribution.NewService(repo, nil, nil, nil)
 	ctx := context.Background()
 
 	existing := &contribution.Contribution{

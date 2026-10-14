@@ -104,7 +104,7 @@ func TestTOTP_Enroll_ReturnsProvisioningURIAndQR(t *testing.T) {
 
 	key, err := otp.NewKeyFromURL(data["uri"].(string))
 	require.NoError(t, err, "URI must be parseable by a standard TOTP library")
-	assert.Equal(t, "Moistello", key.Issuer())
+	assert.Equal(t, "Deodes", key.Issuer())
 	assert.Equal(t, "jane@example.com", key.AccountName())
 	assert.Equal(t, data["secret"], key.Secret())
 

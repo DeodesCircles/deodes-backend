@@ -24,7 +24,7 @@ server:
   shutdown_timeout: "30s"
 
 database:
-  # Optional read replica (env MOISTELLO_DATABASE_REPLICA_URL). When set,
+  # Optional read replica (env DEODES_DATABASE_REPLICA_URL). When set,
   # whitelisted read-heavy analytics queries use it; otherwise the primary.
   replica_url: ""
   max_open_conns: 50
@@ -40,30 +40,18 @@ redis:
 
 rabbitmq:
   url: "amqp://guest:guest@localhost:5672/"
-  exchange: "moistello.events"
+  exchange: "deodes.events"
   queues:
-    notifications: "moistello.notifications"
-    webhooks: "moistello.webhooks"
+    notifications: "deodes.notifications"
+    webhooks: "deodes.webhooks"
 
-stellar:
-  # Master key credentials MUST be provided via environment variables at runtime.
-  # Set the following before starting the server:
-  #   MOISTELLO_STELLAR_MASTER_SECRET_KEY=<your-secret-key>
-  #   MOISTELLO_STELLAR_MASTER_PUBLIC_KEY=<your-public-key>
-  # Never commit actual key values to source control.
-  network: "testnet"
-  horizon_url: "https://horizon-testnet.stellar.org"
-  soroban_rpc_url: "https://soroban-testnet.stellar.org"
-  network_passphrase: "Test SDF Network ; September 2015"
-  usdc_issuer: "GAX23V3WWDPPR5WRER3KTEUTDLSCGZYMSJY5FDRRKKCIQ4JADF5T27RC"
-  wallet_min_balance: 10.0
 
 auth:
   # Provide JWT private/public keys either via the env vars JWT_PRIVATE_KEY /
   # JWT_PUBLIC_KEY or by placing the PEM files at the configured paths below.
   jwt_private_key_path: "./config/keys/jwt-private.pem"
   jwt_public_key_path: "./config/keys/jwt-public.pem"
-  access_token_ttl: "240m"
+  access_token_ttl: "15m" # Phase 2.1 freeze: short-lived access (16x smaller stolen-token window than the former 240m).
   refresh_token_ttl: "168h"
   nonce_ttl: "5m"
   # Expired-session reclamation runs only from the scheduled cleanup job
@@ -107,13 +95,14 @@ notification:
     fcm_server_key: ""
 
 # cors.allowed_origins is intentionally not set here. The allowed origins are
-# resolved per environment by config/cors.go:
+# resolved per environment by config/cors.go (Phase 0.3 freeze, Deodes only):
 #   development -> http://localhost:1110, http://127.0.0.1:1110
-#   staging     -> https://staging.moistello.io
-#   production  -> https://app.moistello.io, https://www.moistello.io
-# Override with ALLOWED_ORIGINS (comma separated) or
-# MOISTELLO_CORS_ALLOWED_ORIGINS. A wildcard or loopback origin is rejected
-# outside development so a misconfigured deployment fails at startup.
+#   staging     -> https://staging.deodes.com
+#   production  -> https://app.deodes.com, https://www.deodes.com, https://deodes.com
+# Override with DEODES_CORS_ALLOWED_ORIGINS (canonical; DEODES_* accepted
+# as legacy fallback) or ALLOWED_ORIGINS (comma separated). A wildcard or
+# loopback origin is rejected outside development so a misconfigured
+# deployment fails at startup.
 cors:
   allowed_methods:
     - "GET"
@@ -144,11 +133,6 @@ logging:
   level: "debug"
   format: "json"
   output: "stdout"
-
-yellow_card:
-  api_key: ""
-  api_secret: ""
-  webhook_secret: ""
 
 # Mobile-money bridge (#190, product-spec.md §7) for non-NGN markets.
 # Each provider is only registered at startup when its credentials are set.
@@ -188,10 +172,3 @@ governance:
   # while it sits inside its timelock. 33 means a third of voters.
   cancel_threshold_pct: 33
 
-# Deployed Contract IDs (Testnet)
-contracts:
-  circle_factory: "CADZWDGER6PYEWVHZDZ5HMEV6A5TKFVD4EY4DSPUTEKAM2KDPEABGJQU"
-  circle: "CALNXOUPT267LRRUCIF6OICEVGVEVKH2D2SX3YURCB4JXLDOF5TXVPCN"
-  reputation_registry: "CCEEJKQCYO7CXBFZBSGHS6AK2CCBU2HY2HK4VXQDPZ3XX3X3KEDGXQ7K"
-  governance_token: "CDOBQSJZJD4RIE2V5Q2IOJ6PBPSE2FT46BCD5WXW64ZN4KEUMYGBX3CS"
-  treasury: "CASXVLHWI56BBKLZHDHCFMCXDWJ4XWEMZABVBUIQBPDHVK4UW6ICUSFI"

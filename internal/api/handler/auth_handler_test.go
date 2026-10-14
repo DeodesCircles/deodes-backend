@@ -117,16 +117,16 @@ func TestAuthHandler_Nonce(t *testing.T) {
 	userSvc := user.NewService(mockUserRepo, nil)
 
 	nonceResp := &auth.Nonce{
-		WalletAddress: "GAX23V3WWDPPR5WRER3KTEUTDLSCGZYMSJY5FDRRKKCIQ4JADF5T27RC",
+		WalletAddress: "0x51b45Ba8570551e0D1fe818227d8bAa8b556694D",
 		Nonce:         "nonce-123",
 	}
-	mockAuthSvc.On("GenerateNonce", mock.Anything, "GAX23V3WWDPPR5WRER3KTEUTDLSCGZYMSJY5FDRRKKCIQ4JADF5T27RC").Return(nonceResp, nil)
+	mockAuthSvc.On("GenerateNonce", mock.Anything, "0x51b45Ba8570551e0D1fe818227d8bAa8b556694D").Return(nonceResp, nil)
 
 	h := handler.NewAuthHandler(mockAuthSvc, userSvc, nil, nil, nil, nil, nil, nil)
 	r := gin.New()
 	r.POST("/auth/nonce", h.Nonce)
 
-	body, _ := json.Marshal(map[string]string{"walletAddress": "GAX23V3WWDPPR5WRER3KTEUTDLSCGZYMSJY5FDRRKKCIQ4JADF5T27RC"})
+	body, _ := json.Marshal(map[string]string{"walletAddress": "0x51b45Ba8570551e0D1fe818227d8bAa8b556694D"})
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/auth/nonce", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -166,13 +166,13 @@ func TestAuthHandler_Nonce_ServiceError(t *testing.T) {
 	mockUserRepo := new(userMocks.Repository)
 	userSvc := user.NewService(mockUserRepo, nil)
 
-	mockAuthSvc.On("GenerateNonce", mock.Anything, "GAX23V3WWDPPR5WRER3KTEUTDLSCGZYMSJY5FDRRKKCIQ4JADF5T27RC").Return(nil, errors.New("redis error"))
+	mockAuthSvc.On("GenerateNonce", mock.Anything, "0x51b45Ba8570551e0D1fe818227d8bAa8b556694D").Return(nil, errors.New("redis error"))
 
 	h := handler.NewAuthHandler(mockAuthSvc, userSvc, nil, nil, nil, nil, nil, nil)
 	r := gin.New()
 	r.POST("/auth/nonce", h.Nonce)
 
-	body, _ := json.Marshal(map[string]string{"walletAddress": "GAX23V3WWDPPR5WRER3KTEUTDLSCGZYMSJY5FDRRKKCIQ4JADF5T27RC"})
+	body, _ := json.Marshal(map[string]string{"walletAddress": "0x51b45Ba8570551e0D1fe818227d8bAa8b556694D"})
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/auth/nonce", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")

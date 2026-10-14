@@ -10,7 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 
-	moistelloredis "github.com/deodes/backend/pkg/redis"
+	deodesredis "github.com/deodes/backend/pkg/redis"
 )
 
 const (
@@ -38,7 +38,7 @@ type Reconciler struct {
 	service  Service
 	interval time.Duration
 	jitter   time.Duration
-	lock     *moistelloredis.Lock
+	lock     *deodesredis.Lock
 
 	jitterFn func(time.Duration) time.Duration
 
@@ -65,7 +65,7 @@ func NewReconciler(rdb *redis.Client, svc Service, interval, jitter time.Duratio
 		// #416: the single-flight lock is now the shared helper in pkg/redis,
 		// so the swap sweeper guards its pass with the same implementation
 		// rather than a second copy of the token/heartbeat logic.
-		lock:     moistelloredis.NewLock(rdb, reconcileLockKey, DefaultReconcileLockTTL),
+		lock:     deodesredis.NewLock(rdb, reconcileLockKey, DefaultReconcileLockTTL),
 		jitterFn: randomJitter,
 		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),

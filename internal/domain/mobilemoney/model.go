@@ -10,8 +10,7 @@ const (
 )
 
 // Transaction is the persisted record of one mobile-money bridge operation,
-// mirroring the deposit/withdrawal pattern used for the YellowCard (NGN)
-// bridge so reconciliation and idempotency work the same way across both.
+// with reconciliation and idempotency built in from the start.
 type Transaction struct {
 	ID                 string     `json:"id" db:"id"`
 	UserID             string     `json:"userId" db:"user_id"`

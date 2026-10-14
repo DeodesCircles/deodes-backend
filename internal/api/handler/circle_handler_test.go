@@ -90,7 +90,8 @@ func TestCircleHandler_CreateCircle_InvalidPayload(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	r.ServeHTTP(w, req)
 
-	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "VALIDATION_ERROR")
 }
 
 func TestCircleHandler_ListCircles_Empty(t *testing.T) {
@@ -193,7 +194,7 @@ func TestCircleHandler_JoinCircle_Success(t *testing.T) {
 
 	c := &circle.Circle{
 		ID: cid, Name: "Test", Status: circle.CircleStatusActive,
-		MaxMembers: 10, CircleType: circle.CircleTypePublic,
+		MaxMembers: 10, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC,
 	}
 	repo.On("FindByID", mock.Anything, cid).Return(c, nil)
 	repo.On("GetMemberCount", mock.Anything, cid).Return(3, nil)
@@ -228,7 +229,7 @@ func TestCircleHandler_JoinCircle_CircleFull(t *testing.T) {
 
 	c := &circle.Circle{
 		ID: cid, Name: "Test", Status: circle.CircleStatusActive,
-		MaxMembers: 5, CircleType: circle.CircleTypePublic,
+		MaxMembers: 5, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC,
 	}
 	repo.On("FindByID", mock.Anything, cid).Return(c, nil)
 	repo.On("GetMemberCount", mock.Anything, cid).Return(5, nil)
@@ -246,8 +247,119 @@ func TestCircleHandler_JoinCircle_CircleFull(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	r.ServeHTTP(w, req)
 
-	assert.Equal(t, 400, w.Code)
+	assert.Equal(t, 409, w.Code)
 	repo.AssertExpectations(t)
+}
+
+func TestCircleHandler_JoinCircle_IdempotentRejoin(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	repo := new(circleMocks.Repository)
+	svc := circle.NewService(repo, nil, circle.Dependencies{})
+	cid := uuid.New()
+	uid := uuid.New()
+
+	c := &circle.Circle{
+		ID: cid, Name: "Test", Status: circle.CircleStatusActive,
+		MaxMembers: 10, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC,
+	}
+	existing := &circle.CircleMember{CircleID: cid, UserID: uid, Status: circle.MemberStatusActive}
+	repo.On("FindByID", mock.Anything, cid).Return(c, nil)
+	repo.On("GetMemberCount", mock.Anything, cid).Return(3, nil)
+	repo.On("FindMemberByCircleAndUser", mock.Anything, cid, uid).Return(existing, nil)
+
+	h := handler.NewCircleHandler(svc, nil, nil, nil)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("userID", uid.String())
+		c.Next()
+	})
+	r.POST("/circles/:id/join", h.JoinCircle)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/circles/"+cid.String()+"/join", bytes.NewBufferString("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	// Idempotent re-join answers 200 with duplicate:true, not a 4xx.
+	assert.Equal(t, 200, w.Code)
+	assert.Contains(t, w.Body.String(), `"success":true`)
+	assert.Contains(t, w.Body.String(), `"duplicate":true`)
+	repo.AssertExpectations(t)
+}
+
+func TestCircleHandler_JoinCircle_EndedCircle(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	repo := new(circleMocks.Repository)
+	svc := circle.NewService(repo, nil, circle.Dependencies{})
+	cid := uuid.New()
+	uid := uuid.New()
+
+	c := &circle.Circle{
+		ID: cid, Name: "Done", Status: circle.CircleStatusCompleted,
+		MaxMembers: 10, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC,
+	}
+	repo.On("FindByID", mock.Anything, cid).Return(c, nil)
+
+	h := handler.NewCircleHandler(svc, nil, nil, nil)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("userID", uid.String())
+		c.Next()
+	})
+	r.POST("/circles/:id/join", h.JoinCircle)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/circles/"+cid.String()+"/join", bytes.NewBufferString("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+	repo.AssertExpectations(t)
+}
+
+func TestCircleHandler_JoinCircle_Unauthenticated(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	repo := new(circleMocks.Repository)
+	svc := circle.NewService(repo, nil, circle.Dependencies{})
+	cid := uuid.New()
+
+	h := handler.NewCircleHandler(svc, nil, nil, nil)
+	r := gin.New()
+	// No userID in context: the auth middleware normally guarantees one,
+	// but a direct call must still be a 401, not a 500.
+	r.POST("/circles/:id/join", h.JoinCircle)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/circles/"+cid.String()+"/join", bytes.NewBufferString("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestCircleHandler_JoinCircle_InvalidCircleID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	repo := new(circleMocks.Repository)
+	svc := circle.NewService(repo, nil, circle.Dependencies{})
+
+	h := handler.NewCircleHandler(svc, nil, nil, nil)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("userID", uuid.New().String())
+		c.Next()
+	})
+	r.POST("/circles/:id/join", h.JoinCircle)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/circles/not-a-uuid/join", bytes.NewBufferString("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 func TestCircleHandler_GetMembers(t *testing.T) {
@@ -578,6 +690,63 @@ func TestCircleHandler_ListCircles_NilSliceReturned(t *testing.T) {
 
 	assert.Equal(t, 200, w.Code)
 	assert.Contains(t, w.Body.String(), "[]")
+	repo.AssertExpectations(t)
+}
+
+func TestCircleHandler_ListCircles_WithCurrencyAndSort(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	repo := new(circleMocks.Repository)
+	svc := circle.NewService(repo, nil, circle.Dependencies{})
+
+	circles := []circle.Circle{
+		{ID: uuid.New(), Name: "USDC Circle", Currency: circle.CurrencyUSDC},
+	}
+	filter := circle.CircleFilter{
+		Currency: circle.CurrencyUSDC, SortBy: "amount", SortOrder: "desc",
+		Page: 1, Limit: 20,
+	}
+	repo.On("List", mock.Anything, filter).Return(circles, nil)
+	repo.On("Count", mock.Anything, filter).Return(1, nil)
+
+	h := handler.NewCircleHandler(svc, nil, nil, nil)
+	r := gin.New()
+	r.GET("/circles", h.ListCircles)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/circles?currency=USDC&sortBy=amount&sortOrder=desc", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, 200, w.Code)
+	assert.Contains(t, w.Body.String(), "USDC Circle")
+	repo.AssertExpectations(t)
+}
+
+func TestCircleHandler_ListCircles_OpenOnlyIgnoresUnknownType(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	repo := new(circleMocks.Repository)
+	svc := circle.NewService(repo, nil, circle.Dependencies{})
+
+	circles := []circle.Circle{
+		{ID: uuid.New(), Name: "Open Circle", Status: circle.CircleStatusPending},
+	}
+	// The dashboard's "my-circles" tab is resolved client-side; an unknown
+	// type must not become a WHERE clause matching nothing.
+	filter := circle.CircleFilter{OpenOnly: true, Page: 1, Limit: 20}
+	repo.On("List", mock.Anything, filter).Return(circles, nil)
+	repo.On("Count", mock.Anything, filter).Return(1, nil)
+
+	h := handler.NewCircleHandler(svc, nil, nil, nil)
+	r := gin.New()
+	r.GET("/circles", h.ListCircles)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/circles?type=my-circles&openOnly=true", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, 200, w.Code)
+	assert.Contains(t, w.Body.String(), "Open Circle")
 	repo.AssertExpectations(t)
 }
 

@@ -345,7 +345,6 @@ func TestCircleLifecycleEndpoints(t *testing.T) {
 	assert.Equal(t, float64(100), previewData["totalGrossAmount"])
 	assert.Equal(t, float64(0.5), previewData["protocolFee"])
 	assert.Equal(t, float64(99.5), previewData["totalNetAmount"])
-	assert.Equal(t, float64(0.00001), previewData["stellarFeeEstimate"])
 	assert.Equal(t, float64(0.001), previewData["arcFeeEstimate"])
 	require.Len(t, store.payouts, 0, "preview must not record any payout")
 
@@ -705,10 +704,10 @@ func TestCircleLifecycle_TriggerPayout_RoundDueGuards(t *testing.T) {
 	})
 	assert.Equal(t, http.StatusUnprocessableEntity, code)
 
-	// Wrong-rail receipts are rejected: Stellar-style hashes fail fast.
+	// Wrong-rail receipts are rejected: legacy-style hashes fail fast.
 	code, _ = lifecycleRequest(t, router, http.MethodPost, payoutPath, organizer.String(), map[string]any{
 		"recipientId": member.String(), "roundNumber": 1, "amount": 100,
-		"feeAmount": 0, "txnHash": "stellar-style-hash", "payoutType": "fixed",
+		"feeAmount": 0, "txnHash": "legacy-style-hash", "payoutType": "fixed",
 	})
 	assert.Equal(t, http.StatusUnprocessableEntity, code)
 

@@ -26,8 +26,8 @@ func TestCircleLifecycle(t *testing.T) {
 
 	userSvc := user.NewService(userRepo, nil)
 	circleSvc := circle.NewService(circleRepo, nil, circle.Dependencies{})
-	contribSvc := contribution.NewService(contribRepo, nil, nil, nil, "", nil)
-	payoutSvc := payout.NewService(payoutRepo, nil, nil, nil)
+	contribSvc := contribution.NewService(contribRepo, nil, nil, nil)
+	payoutSvc := payout.NewService(payoutRepo, nil, nil)
 
 	_ = contribSvc
 	_ = payoutSvc
@@ -75,7 +75,7 @@ func TestCircleLifecycle(t *testing.T) {
 		circleID := uuid.New()
 		c := &circle.Circle{
 			ID: circleID, Name: "Test", Status: circle.CircleStatusActive,
-			MaxMembers: 3, CircleType: circle.CircleTypePublic,
+			MaxMembers: 3, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC,
 		}
 
 		circleRepo.On("FindByID", mock.Anything, circleID).Return(c, nil).Once()
@@ -155,7 +155,7 @@ func TestCircleLifecycle_FullCircle(t *testing.T) {
 	c, err := circleSvc.Create(nil, org.ID.String(), circle.CreateCircleInput{
 		Name: "Full Circle", CircleType: circle.CircleTypePublic,
 		PayoutType: circle.PayoutTypeRandom, ContributionAmount: 50,
-		Currency: circle.CurrencyXLM, Frequency: circle.FrequencyDaily,
+		Currency: circle.CurrencyUSDC, Frequency: circle.FrequencyDaily,
 		MaxMembers: 3, MaxStrikes: 3,
 	})
 	assert.NoError(t, err)
@@ -163,7 +163,7 @@ func TestCircleLifecycle_FullCircle(t *testing.T) {
 	circleRepo.AssertExpectations(t)
 
 	circleRepo.On("FindByID", mock.Anything, circleID).Return(
-		&circle.Circle{ID: circleID, Name: "Full Circle", Status: circle.CircleStatusActive, MaxMembers: 3, CircleType: circle.CircleTypePublic},
+		&circle.Circle{ID: circleID, Name: "Full Circle", Status: circle.CircleStatusActive, MaxMembers: 3, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC},
 		nil,
 	).Once()
 	circleRepo.On("GetMemberCount", mock.Anything, circleID).Return(2, nil).Once()
@@ -173,7 +173,7 @@ func TestCircleLifecycle_FullCircle(t *testing.T) {
 	assert.NoError(t, err)
 
 	circleRepo.On("FindByID", mock.Anything, circleID).Return(
-		&circle.Circle{ID: circleID, Name: "Full Circle", Status: circle.CircleStatusActive, MaxMembers: 3, CircleType: circle.CircleTypePublic},
+		&circle.Circle{ID: circleID, Name: "Full Circle", Status: circle.CircleStatusActive, MaxMembers: 3, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyUSDC},
 		nil,
 	).Once()
 	circleRepo.On("GetMemberCount", mock.Anything, circleID).Return(3, nil).Once()

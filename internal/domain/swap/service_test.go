@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/deodes/backend/internal/domain/user"
+	"github.com/deodes/backend/pkg/apperrors"
 )
 
 // ── Fakes ─────────────────────────────────────────────────────────────────
@@ -148,6 +149,84 @@ func createdOffer(id, offeror string) *SwapOffer {
 }
 
 // ── Sweep worker ──────────────────────────────────────────────────────────
+
+// Phase 2.4: with the on-chain escrow client purged the service is
+// constructed with a nil escrow client. Every on-chain entry point must fail
+// fast with ErrChainDisabled instead of nil-panicking — including the background
+// sweeper, which must hand the claim back for a later tick.
+func TestNilEscrow_CreateSwapOfferFailsFast(t *testing.T) {
+	ctx := context.Background()
+	users := &fakeUserService{getByIDFn: func(ctx context.Context, id string) (*user.User, error) {
+		return walletUser(id), nil
+	}}
+	svc := NewService(&fakeRepo{}, nil, users, nil)
+	_, err := svc.CreateSwapOffer(ctx, "u1", SwapOfferRequest{
+		CircleID: "c1", OfferorAsset: "USDC", OfferorAmount: 10,
+		RequestedAsset: "USDC", RequestedAmount: 10, ExpiresIn: 24,
+	})
+	require.ErrorIs(t, err, apperrors.ErrChainDisabled)
+}
+
+func TestNilEscrow_AcceptSwapOfferFailsFast(t *testing.T) {
+	ctx := context.Background()
+	repo := &fakeRepo{
+		getByIDFn: func(ctx context.Context, id string) (*SwapOffer, error) {
+			return createdOffer(id, "u1"), nil
+		},
+		casFn: func(ctx context.Context, id string, e, n SwapOfferStatus, h *string) (bool, error) {
+			return true, nil
+		},
+	}
+	users := &fakeUserService{getByIDFn: func(ctx context.Context, id string) (*user.User, error) {
+		return walletUser(id), nil
+	}}
+	svc := NewService(repo, nil, users, nil)
+	_, err := svc.AcceptSwapOffer(ctx, "u2", "offer-1")
+	require.ErrorIs(t, err, apperrors.ErrChainDisabled)
+}
+
+func TestNilEscrow_CancelSwapOfferFailsFast(t *testing.T) {
+	ctx := context.Background()
+	repo := &fakeRepo{
+		getByIDFn: func(ctx context.Context, id string) (*SwapOffer, error) {
+			return createdOffer(id, "u1"), nil
+		},
+	}
+	users := &fakeUserService{getByIDFn: func(ctx context.Context, id string) (*user.User, error) {
+		return walletUser(id), nil
+	}}
+	svc := NewService(repo, nil, users, nil)
+	_, err := svc.CancelSwapOffer(ctx, "u1", "offer-1")
+	require.ErrorIs(t, err, apperrors.ErrChainDisabled)
+}
+
+func TestNilEscrow_SweepReleasesClaimForLaterTick(t *testing.T) {
+	ctx := context.Background()
+	offers := []SwapOffer{*createdOffer("offer-1", "u1")}
+	repo := &fakeRepo{
+		listExpiredFn: func(ctx context.Context, now time.Time) ([]SwapOffer, error) {
+			return offers, nil
+		},
+		claimFn: func(ctx context.Context, id string, now time.Time) (bool, error) {
+			return true, nil
+		},
+		getByIDFn: func(ctx context.Context, id string) (*SwapOffer, error) {
+			return createdOffer(id, "u1"), nil
+		},
+		releaseClaimFn: func(ctx context.Context, id string) error {
+			return nil
+		},
+	}
+	users := &fakeUserService{getByIDFn: func(ctx context.Context, id string) (*user.User, error) {
+		return walletUser(id), nil
+	}}
+	svc := NewService(repo, nil, users, nil)
+	swept, err := svc.SweepExpiredOffers(ctx)
+	require.NoError(t, err, "a disabled rail must not fail the whole pass")
+	assert.Equal(t, 0, swept)
+	assert.Equal(t, []string{"offer-1"}, repo.releasedClaimIDs)
+	assert.Empty(t, repo.finalizedIDs, "nothing may finalize without escrow")
+}
 
 func TestSweepExpiredOffers_ReleasesEscrowAndMarksExpired(t *testing.T) {
 	ctx := context.Background()

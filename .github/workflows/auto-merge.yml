@@ -1,6 +1,6 @@
-name: "moistello: Auto-Merge"
+name: "deodes: Auto-Merge"
 
-# "moistello" bot — merges a PR automatically 30 minutes AFTER CI goes green.
+# "deodes" bot — merges a PR automatically 30 minutes AFTER CI goes green.
 # It does NOT assign issues or reviewers. You assign those manually.
 #
 # SAFEGUARDS (per repo policy):

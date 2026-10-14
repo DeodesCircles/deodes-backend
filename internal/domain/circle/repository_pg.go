@@ -86,7 +86,7 @@ func scanCircle(row interface{ Scan(...interface{}) error }) (*Circle, error) {
 
 func scanCircleMember(row interface{ Scan(...interface{}) error }) (*CircleMember, error) {
 	var m CircleMember
-	err := row.Scan(&m.CircleID, &m.UserID, &m.Position, &m.Status, &m.JoinedAt)
+	err := row.Scan(&m.CircleID, &m.UserID, &m.Position, &m.Status, &m.Strikes, &m.JoinedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, apperrors.ErrNotFound
@@ -357,7 +357,7 @@ func (r *pgRepo) CreateMember(ctx context.Context, m *CircleMember) error {
 }
 
 func (r *pgRepo) GetMembers(ctx context.Context, circleID uuid.UUID) ([]CircleMember, error) {
-	query := `SELECT circle_id, user_id, position, status, joined_at
+	query := `SELECT circle_id, user_id, position, status, strikes, joined_at
 		FROM circle_members WHERE circle_id = $1 ORDER BY position ASC`
 	rows, err := r.db.QueryxContext(ctx, query, circleID)
 	if err != nil {
@@ -406,9 +406,23 @@ func (r *pgRepo) UpdateMemberStatus(ctx context.Context, circleID, userID uuid.U
 }
 
 func (r *pgRepo) FindMemberByCircleAndUser(ctx context.Context, circleID, userID uuid.UUID) (*CircleMember, error) {
-	query := `SELECT circle_id, user_id, position, status, joined_at
+	query := `SELECT circle_id, user_id, position, status, strikes, joined_at
 		FROM circle_members WHERE circle_id = $1 AND user_id = $2`
 	return scanCircleMember(r.db.QueryRowxContext(ctx, query, circleID, userID))
+}
+
+// UpdateMemberStrikes persists the 2.7 strike counter.
+func (r *pgRepo) UpdateMemberStrikes(ctx context.Context, circleID, userID uuid.UUID, strikes int) error {
+	query := `UPDATE circle_members SET strikes = $1 WHERE circle_id = $2 AND user_id = $3`
+	result, err := r.db.ExecContext(ctx, query, strikes, circleID, userID)
+	if err != nil {
+		return fmt.Errorf("updating member strikes: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return ErrNotMember
+	}
+	return nil
 }
 
 func (r *pgRepo) FindCirclesByUserID(ctx context.Context, userID uuid.UUID) ([]Circle, error) {

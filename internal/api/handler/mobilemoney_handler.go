@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -14,8 +15,7 @@ import (
 
 // MobileMoneyHandler exposes the mobile-money bridge (#190) — on-ramp
 // (mobile money -> USDC) and off-ramp (USDC -> mobile money) for non-NGN
-// markets — following the same request shape as DepositHandler's NGN
-// bridge via Yellow Card.
+// markets.
 type MobileMoneyHandler struct {
 	svc    mobilemoney.Service
 	wallet wallet.Service
@@ -25,8 +25,22 @@ func NewMobileMoneyHandler(svc mobilemoney.Service, walletSvc wallet.Service) *M
 	return &MobileMoneyHandler{svc: svc, wallet: walletSvc}
 }
 
+// getIdempotencyKey prefers an explicit body key, falling back to the
+// Idempotency-Key / X-Idempotency-Key headers. (Moved here when the fiat
+// ramp handlers were removed; mobile-money flows still need it.)
+func getIdempotencyKey(c *gin.Context, bodyKey string) string {
+	if bodyKey != "" {
+		return strings.TrimSpace(bodyKey)
+	}
+	key := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	if key == "" {
+		key = strings.TrimSpace(c.GetHeader("X-Idempotency-Key"))
+	}
+	return key
+}
+
 // @Summary Initiate mobile-money on-ramp
-// @Description Collects funds from the caller's mobile money wallet and credits USDC to their Stellar wallet once settled. Requires an idempotency key.
+// @Description Collects funds from the caller's mobile money wallet and credits USDC to their Arc wallet once settled. Requires an idempotency key.
 // @Tags Wallet
 // @Accept json
 // @Produce json

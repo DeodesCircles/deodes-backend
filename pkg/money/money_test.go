@@ -25,7 +25,7 @@ func TestFromString_ExactParsing(t *testing.T) {
 	for in, want := range cases {
 		got, err := FromString(in)
 		require.NoError(t, err, in)
-		assert.Equal(t, want, got.Stroops(), in)
+		assert.Equal(t, want, got.Minor(), in)
 	}
 }
 
@@ -36,7 +36,7 @@ func TestFromString_Rejects(t *testing.T) {
 	}
 }
 
-func TestFromFloat64_RoundsToNearestStroop(t *testing.T) {
+func TestFromFloat64_RoundsToNearestMinor(t *testing.T) {
 	cases := map[float64]int64{
 		0.1 + 0.2:    3_000_000,
 		1.00000006:   10_000_001,
@@ -51,7 +51,7 @@ func TestFromFloat64_RoundsToNearestStroop(t *testing.T) {
 	for in, want := range cases {
 		got, err := FromFloat64(in)
 		require.NoError(t, err)
-		assert.Equal(t, want, got.Stroops(), "%v", in)
+		assert.Equal(t, want, got.Minor(), "%v", in)
 	}
 	for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), 1e300} {
 		_, err := FromFloat64(bad)
@@ -62,15 +62,15 @@ func TestFromFloat64_RoundsToNearestStroop(t *testing.T) {
 func TestString_CanonicalSevenDecimals(t *testing.T) {
 	assert.Equal(t, "0.0000000", Zero().String())
 	assert.Equal(t, "1.5000000", MustFromString("1.5").String())
-	assert.Equal(t, "-0.0000001", FromStroops(-1).String())
-	assert.Equal(t, "922337203685.4775807", FromStroops(math.MaxInt64).String())
-	assert.Equal(t, "-922337203685.4775808", FromStroops(math.MinInt64).String())
+	assert.Equal(t, "-0.0000001", FromMinor(-1).String())
+	assert.Equal(t, "922337203685.4775807", FromMinor(math.MaxInt64).String())
+	assert.Equal(t, "-922337203685.4775808", FromMinor(math.MinInt64).String())
 }
 
 func TestStringRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	for i := 0; i < 10_000; i++ {
-		m := FromStroops(rng.Int63() - rng.Int63())
+		m := FromMinor(rng.Int63() - rng.Int63())
 		back, err := FromString(m.String())
 		require.NoError(t, err)
 		assert.True(t, m.Equal(back), "%s", m)
@@ -118,32 +118,32 @@ func TestArithmetic(t *testing.T) {
 }
 
 func TestMulDiv_RoundsHalfAwayFromZero(t *testing.T) {
-	one := FromStroops(1)
+	one := FromMinor(1)
 	half, err := one.MulDiv(1, 2)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), half.Stroops())
+	assert.Equal(t, int64(1), half.Minor())
 
-	negHalf, err := FromStroops(-1).MulDiv(1, 2)
+	negHalf, err := FromMinor(-1).MulDiv(1, 2)
 	require.NoError(t, err)
-	assert.Equal(t, int64(-1), negHalf.Stroops())
+	assert.Equal(t, int64(-1), negHalf.Minor())
 
 	third, err := one.MulDiv(1, 3)
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), third.Stroops())
+	assert.Equal(t, int64(0), third.Minor())
 
 	_, err = one.MulDiv(1, 0)
 	assert.ErrorIs(t, err, ErrDivideByZero)
 }
 
 func TestOverflowIsDetected(t *testing.T) {
-	maxM := FromStroops(math.MaxInt64)
-	_, err := maxM.Add(FromStroops(1))
+	maxM := FromMinor(math.MaxInt64)
+	_, err := maxM.Add(FromMinor(1))
 	assert.ErrorIs(t, err, ErrOverflow)
-	_, err = FromStroops(math.MinInt64).Sub(FromStroops(1))
+	_, err = FromMinor(math.MinInt64).Sub(FromMinor(1))
 	assert.ErrorIs(t, err, ErrOverflow)
 	_, err = maxM.MulInt(2)
 	assert.ErrorIs(t, err, ErrOverflow)
-	_, err = FromStroops(math.MinInt64).Neg()
+	_, err = FromMinor(math.MinInt64).Neg()
 	assert.ErrorIs(t, err, ErrOverflow)
 	_, err = maxM.MulDiv(3, 2)
 	assert.ErrorIs(t, err, ErrOverflow)
@@ -154,7 +154,7 @@ func TestOverflowIsDetected(t *testing.T) {
 func TestPercent_ConservesFunds(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 	for i := 0; i < 5000; i++ {
-		gross := FromStroops(rng.Int63n(1_000_000_000_000))
+		gross := FromMinor(rng.Int63n(1_000_000_000_000))
 		pct := float64(rng.Intn(10000)) / 100.0
 		fee, err := gross.Percent(pct)
 		require.NoError(t, err)
@@ -164,7 +164,7 @@ func TestPercent_ConservesFunds(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, back.Equal(gross), "gross %s fee %s net %s", gross, fee, net)
 		assert.False(t, fee.IsNegative())
-		assert.LessOrEqual(t, fee.Stroops(), gross.Stroops())
+		assert.LessOrEqual(t, fee.Minor(), gross.Minor())
 	}
 }
 
@@ -177,7 +177,7 @@ func TestSQLScanAndValue(t *testing.T) {
 	assert.Equal(t, "0.2500000", m.String())
 
 	require.NoError(t, m.Scan(int64(15)))
-	assert.Equal(t, int64(15), m.Stroops())
+	assert.Equal(t, int64(15), m.Minor())
 
 	require.NoError(t, m.Scan(1.5))
 	assert.Equal(t, "1.5000000", m.String())
@@ -205,7 +205,7 @@ func TestJSON(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(`{"amount":100}`), &in))
 	assert.Equal(t, "100.0000000", in.Amount.String())
 	require.NoError(t, json.Unmarshal([]byte(`{"amount":"0.0000001"}`), &in))
-	assert.Equal(t, int64(1), in.Amount.Stroops())
+	assert.Equal(t, int64(1), in.Amount.Minor())
 	require.NoError(t, json.Unmarshal([]byte(`{"amount":1.5e2}`), &in))
 	assert.Equal(t, "150.0000000", in.Amount.String())
 	require.NoError(t, json.Unmarshal([]byte(`{"amount":null}`), &in))
@@ -214,12 +214,12 @@ func TestJSON(t *testing.T) {
 	assert.Error(t, json.Unmarshal([]byte(`{"amount":0.00000001}`), &in))
 }
 
-func TestFloat64RoundTripWithinOneStroop(t *testing.T) {
+func TestFloat64RoundTripWithinOneMinor(t *testing.T) {
 	rng := rand.New(rand.NewSource(99))
 	for i := 0; i < 10_000; i++ {
-		m := FromStroops(rng.Int63n(1_000_000_000_000_000))
+		m := FromMinor(rng.Int63n(1_000_000_000_000_000))
 		back, err := FromFloat64(m.Float64())
 		require.NoError(t, err)
-		assert.LessOrEqual(t, math.Abs(float64(back.Stroops()-m.Stroops())), 1.0, "%s", m)
+		assert.LessOrEqual(t, math.Abs(float64(back.Minor()-m.Minor())), 1.0, "%s", m)
 	}
 }

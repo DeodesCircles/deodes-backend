@@ -1,7 +1,7 @@
 # API Error Code Catalog (RFC 9457 Problem Details)
 
 ## Overview
-Moistello standardizes all HTTP 4xx and 5xx client and server error responses following **RFC 9457 (Problem Details for HTTP APIs)** while maintaining complete backward compatibility with the legacy response envelope.
+Deodes standardizes all HTTP 4xx and 5xx client and server error responses following **RFC 9457 (Problem Details for HTTP APIs)** while maintaining complete backward compatibility with the legacy response envelope.
 
 Client applications (frontend web, mobile wallets, and SDKs) should branch on the machine-readable `code` field or RFC 9457 `type` URI rather than matching on localized or reworded `message` strings.
 
@@ -16,7 +16,7 @@ Client applications (frontend web, mobile wallets, and SDKs) should branch on th
   "message": "authentication nonce has expired",
   "details": null,
   "requestId": "req-9c87f12a-3b4",
-  "type": "https://moistello.com/probs/nonce-expired",
+  "type": "https://deodes.com/probs/nonce-expired",
   "title": "Unauthorized",
   "status": 401,
   "detail": "authentication nonce has expired",

@@ -8,7 +8,7 @@ import (
 var (
 	ContributionsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Namespace: "moistello",
+			Namespace: "deodes",
 			Name:      "contributions_total",
 			Help:      "Total number of contribution transactions.",
 		},
@@ -17,7 +17,7 @@ var (
 
 	ContributionVolumeTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Namespace: "moistello",
+			Namespace: "deodes",
 			Name:      "contribution_volume_total",
 			Help:      "Total volume of contributions.",
 		},
@@ -26,7 +26,7 @@ var (
 
 	PayoutsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Namespace: "moistello",
+			Namespace: "deodes",
 			Name:      "payouts_total",
 			Help:      "Total number of payout transactions.",
 		},
@@ -35,7 +35,7 @@ var (
 
 	PayoutVolumeTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Namespace: "moistello",
+			Namespace: "deodes",
 			Name:      "payout_volume_total",
 			Help:      "Total volume of payouts.",
 		},
@@ -44,7 +44,7 @@ var (
 
 	UserRegistrationsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Namespace: "moistello",
+			Namespace: "deodes",
 			Name:      "user_registrations_total",
 			Help:      "Total number of user registrations.",
 		},
@@ -53,9 +53,38 @@ var (
 
 	ActiveUsersGauge = promauto.NewGauge(
 		prometheus.GaugeOpts{
-			Namespace: "moistello",
+			Namespace: "deodes",
 			Name:      "active_users_current",
 			Help:      "Current number of active users.",
 		},
+	)
+
+	// Phase 2.6: Arc indexer lag + throughput. Lag is latest finalized
+	// block minus the poller cursor; alert on growth (stall_threshold).
+	IndexerLagBlocks = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "deodes",
+			Name:      "indexer_lag_blocks",
+			Help:      "Arc indexer lag in blocks (latest finalized minus cursor).",
+		},
+		[]string{"chain_id"},
+	)
+
+	IndexerEventsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "deodes",
+			Name:      "indexer_events_total",
+			Help:      "Decoded Arc events by outcome (persisted = new row, replay = dedup hit, skipped = foreign log).",
+		},
+		[]string{"event", "outcome"},
+	)
+
+	IndexerDeadletterTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "deodes",
+			Name:      "indexer_deadletter_total",
+			Help:      "Items parked in arc_deadletter by stage.",
+		},
+		[]string{"stage"},
 	)
 )

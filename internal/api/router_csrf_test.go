@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/deodes/backend/config"
 	"github.com/deodes/backend/internal/api/handler"
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -26,9 +26,10 @@ import (
 // here. Adding a route to this list is a security decision — justify it.
 var csrfExemptRoutes = map[string]string{
 	"POST /webhooks/incoming/:id":   "server-to-server webhook, verified by the handler",
-	"POST /webhooks/yellowcard":     "server-to-server provider webhook, signature-verified by the handler",
 	"POST /v1/auth/register":        "creates the session; no CSRF token can exist yet",
 	"POST /v1/auth/register/verify": "creates the session; no CSRF token can exist yet",
+	"POST /v1/auth/login":           "creates the session from credentials; no CSRF token can exist yet (Phase 2.2: same class as register — no ambient session to ride)",
+	"POST /v1/auth/google":          "creates the session from an ID token; no CSRF token can exist yet (Phase 2.2: same class as register — no ambient session to ride)",
 	"POST /v1/auth/refresh":         "exchanges a refresh token for a new session",
 	"POST /v1/auth/nonce":           "pre-auth wallet challenge",
 	"POST /v1/auth/verify":          "pre-auth wallet signature login; creates the session",
@@ -79,6 +80,23 @@ func newCSRFTestRouter(t *testing.T, mutate ...func(*config.Config)) (*gin.Engin
 	cfg.RateLimit.Global = 1_000_000
 	cfg.RateLimit.Authenticated = 1_000_000
 	cfg.RateLimit.Auth = 1_000_000
+	// Phase 2.2: per-resource buckets default to zero in a bare Config, and a
+	// zero limit 429s every request (fail-closed) before the CSRF middleware
+	// runs — masking the very assertion this harness exists for. Scope the
+	// buckets wide open here; rate behavior itself is covered by
+	// middleware/rate_limit_test.go, not by route-table tests.
+	cfg.RateLimit.OTPLimit = 1_000_000
+	cfg.RateLimit.OTPWindowSeconds = 3600
+	cfg.RateLimit.SwapLimit = 1_000_000
+	cfg.RateLimit.SwapWindowSeconds = 3600
+	cfg.RateLimit.ContributeLimit = 1_000_000
+	cfg.RateLimit.ContributeWindowSeconds = 3600
+	cfg.RateLimit.WalletTransferLimit = 1_000_000
+	cfg.RateLimit.WalletTransferWindowSeconds = 3600
+	cfg.RateLimit.ReferralLimit = 1_000_000
+	cfg.RateLimit.ReferralWindowSeconds = 3600
+	cfg.RateLimit.AdminLimit = 1_000_000
+	cfg.RateLimit.AdminWindowSeconds = 3600
 	cfg.CORS.AllowedOrigins = []string{"https://app.example"}
 	for _, m := range mutate {
 		m(cfg)
@@ -91,11 +109,12 @@ func newCSRFTestRouter(t *testing.T, mutate ...func(*config.Config)) (*gin.Engin
 		&handler.ContributionHandler{}, &handler.PayoutHandler{}, &handler.InviteHandler{},
 		&handler.NotificationHandler{}, &handler.AdminHandler{}, &handler.WebhookHandler{},
 		&handler.HealthHandler{}, &handler.PasskeyCredentialHandler{}, &handler.WalletHandler{},
-		&handler.DepositHandler{}, &handler.MobileMoneyHandler{}, &handler.ChatHandler{},
+		&handler.MobileMoneyHandler{}, &handler.ChatHandler{},
 		&handler.CommunityHandler{}, &handler.WebSocketHandler{}, &handler.SavingsGoalHandler{},
-		&handler.TokenHandler{}, &handler.SwapHandler{}, &handler.GovernanceHandler{},
+		&handler.SwapHandler{}, &handler.GovernanceHandler{},
 		&handler.ReputationHandler{}, &handler.ReferralHandler{}, &handler.ConsentHandler{},
-		&handler.AdminJobQueueHandler{}, &handler.AdminIndexerHandler{}, nil, &handler.YellowCardWebhookHandler{},
+		&handler.SubscriptionHandler{},
+		&handler.AdminJobQueueHandler{}, nil,
 		pubPEM,
 	)
 	return r, token

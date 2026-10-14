@@ -31,8 +31,8 @@ func TestSafeURL(t *testing.T) {
 		},
 		{
 			name: "drops userinfo",
-			in:   "https://user:password@rpc.example.com/soroban",
-			want: "https://rpc.example.com/soroban",
+			in:   "https://user:password@rpc.example.com/rpc",
+			want: "https://rpc.example.com/rpc",
 		},
 		{
 			name: "drops trailing question mark",
@@ -46,8 +46,8 @@ func TestSafeURL(t *testing.T) {
 		},
 		{
 			name: "keeps port",
-			in:   "http://127.0.0.1:8000/soroban?key=secret",
-			want: "http://127.0.0.1:8000/soroban",
+			in:   "http://127.0.0.1:8000/rpc?key=secret",
+			want: "http://127.0.0.1:8000/rpc",
 		},
 		{
 			name: "empty stays empty",
@@ -74,7 +74,7 @@ func TestSafeURL_LeavesNoSecrets(t *testing.T) {
 	secrets := []string{
 		"https://rpc.example.com/s?api_key=AKIAIOSFODNN7EXAMPLE",
 		"https://api.example.com/v1/x?access_token=ghp_16CharsAndMore",
-		"https://user:hunter2@stellar.example.com/soroban",
+		"https://user:hunter2@chain.example.com/rpc",
 		"https://api.example.com/v1/x?email=person@example.com",
 	}
 
@@ -112,12 +112,12 @@ func TestSpanAttributes_CarryNoPII(t *testing.T) {
 		attribute.String("db.isolation_level", "read committed"),
 		attribute.Bool("db.filter.contract_version", true),
 		attribute.Bool("db.filter.ledger_range", true),
-		attribute.String("rpc.system", "stellar"),
+		attribute.String("rpc.system", "arc"),
 		attribute.String("rpc.method", "getLedgerEntries"),
 		attribute.Int("rpc.contract_count", 3),
 		attribute.Int64("rpc.start_ledger", 1234),
 		attribute.String("http.method", "POST"),
-		attribute.String("http.url", tracing.SafeURL("https://rpc.example.com/soroban?api_key=secret")),
+		attribute.String("http.url", tracing.SafeURL("https://rpc.example.com/rpc?api_key=secret")),
 		attribute.String("request.id", "3f0d9a1e-1c2b-4c3d-8e9f-0a1b2c3d4e5f"),
 		attribute.String("duration.ms", "12"),
 	}

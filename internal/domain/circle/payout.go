@@ -43,7 +43,7 @@ func VoteTally(votes map[string]int) string {
 }
 
 // PayoutPool returns the total pool for a round: every member's contribution
-// plus any late penalties collected, computed exactly in stroops.
+// plus any late penalties collected, computed exactly in minor units.
 func PayoutPool(contribution money.Money, memberCount int, latePenalties money.Money) (money.Money, error) {
 	pool, err := contribution.MulInt(int64(memberCount))
 	if err != nil {

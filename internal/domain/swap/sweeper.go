@@ -8,7 +8,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 
-	moistelloredis "github.com/deodes/backend/pkg/redis"
+	deodesredis "github.com/deodes/backend/pkg/redis"
 )
 
 // SweepLockKey is the single-flight lock key every replica contends for (#416).
@@ -31,7 +31,7 @@ const DefaultSweepInterval = time.Minute
 type Sweeper struct {
 	service  *Service
 	interval time.Duration
-	lock     *moistelloredis.Lock
+	lock     *deodesredis.Lock
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -51,7 +51,7 @@ func NewSweeper(service *Service, rdb *redis.Client, interval time.Duration) *Sw
 	return &Sweeper{
 		service:  service,
 		interval: interval,
-		lock:     moistelloredis.NewLock(rdb, SweepLockKey, moistelloredis.DefaultLockTTL),
+		lock:     deodesredis.NewLock(rdb, SweepLockKey, deodesredis.DefaultLockTTL),
 		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
 	}

@@ -4,13 +4,13 @@
     ],
     "swagger": "2.0",
     "info": {
-        "description": "Decentralized savings circles on Stellar. REST API for circles, contributions, payouts, reputation, and governance.",
-        "title": "Moistello API",
-        "termsOfService": "https://moistello.com/terms",
+        "description": "Decentralized savings circles on Arc. REST API for circles, contributions, payouts, reputation, and governance.",
+        "title": "Deodes API",
+        "termsOfService": "https://deodes.com/terms",
         "contact": {
-            "name": "Moistello Support",
-            "url": "https://moistello.com/support",
-            "email": "support@moistello.com"
+            "name": "Deodes Support",
+            "url": "https://deodes.com/support",
+            "email": "support@deodes.com"
         },
         "license": {
             "name": "MIT",
@@ -18,7 +18,7 @@
         },
         "version": "1.0.0"
     },
-    "host": "moistello.com",
+    "host": "deodes.com",
     "basePath": "/v1",
     "paths": {
         "/admin/audit-log": {

@@ -23,7 +23,7 @@ func TestLateFee_Property_RoundTrip(t *testing.T) {
 		expected := contribution * percent / 100
 		got := fee.Float64()
 
-		// Allow rounding tolerance of ±1 stroop (0.0000001)
+		// Allow rounding tolerance of ±1 minor unit (0.0000001)
 		if math.Abs(got-expected) > 0.0000001 {
 			t.Errorf("LateFee(%v, %v) = %v, want ≈ %v", contribution, percent, got, expected)
 		}

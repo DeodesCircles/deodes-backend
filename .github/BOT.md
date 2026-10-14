@@ -1,12 +1,12 @@
-# Moistello Bot Setup & Usage
+# Deodes Bot Setup & Usage
 
-The bot runs as **GitHub Actions workflows** inside this repo and is named **moistello**. It handles:
+The bot runs as **GitHub Actions workflows** inside this repo and is named **deodes**. It handles:
 
 | What | Workflow | Trigger |
 |------|----------|---------|
 | Lint + test + build gate | `ci.yml` | every PR / push |
-| **Auto-merge** 30 min after CI is green | `moistello: Auto-Merge` | CI success (30m delay), `/merge` comment |
-| **Auto-fix** conflicts + failing CI | `moistello: Auto-Fix` | PR conflict, CI failure (PR *and* `main`) |
+| **Auto-merge** 30 min after CI is green | `deodes: Auto-Merge` | CI success (30m delay), `/merge` comment |
+| **Auto-fix** conflicts + failing CI | `deodes: Auto-Fix` | PR conflict, CI failure (PR *and* `main`) |
 
 The bot **never assigns issues or reviewers** — that stays manual (you decide who implements what).
 
@@ -14,7 +14,7 @@ The bot **never assigns issues or reviewers** — that stays manual (you decide 
 
 ## Free-tier note (your concern)
 
-- Both `moistello-*` repos are **public** → GitHub Actions minutes are **unlimited** (no charge).
+- Both `deodes-*` repos are **public** → GitHub Actions minutes are **unlimited** (no charge).
 - **Auto-merge** is a native GitHub feature available on the free plan for public repos.
 - All workflows are **webhook-driven** (no polling), so they don't hit REST API rate limits.
 - The only cost, if you want it, is the **LLM API key** used by the AI auto-fix step
@@ -37,11 +37,11 @@ The bot **never assigns issues or reviewers** — that stays manual (you decide 
 3. Optionally require 1 approving review if you want a human gate before the bot merges
    (set `require_human_review: true` in `.github/bot-config.yml` to match).
 
-With auto-merge, the **moistello** bot merges a linked PR **30 minutes after CI passes** (set `delay_minutes` in `.github/bot-config.yml`). If branch protection requires a human review, the bot waits for that review before the 30-minute countdown completes.
+With auto-merge, the **deodes** bot merges a linked PR **30 minutes after CI passes** (set `delay_minutes` in `.github/bot-config.yml`). If branch protection requires a human review, the bot waits for that review before the 30-minute countdown completes.
 
 ## Auto-fix behavior
 
-The **moistello** bot auto-fixes two things, both gated behind `OPENCODE_API_KEY`
+The **deodes** bot auto-fixes two things, both gated behind `OPENCODE_API_KEY`
 (so it only acts when you've enabled AI fixing):
 
 1. **Merge conflicts** — on a PR with conflicts it first tries a clean rebase; if that's
@@ -64,7 +64,7 @@ DeepSeek V4 switches to **peak/off-peak pricing** (peak = 2.4–4.7x the off-pea
 - **Peak hours:** 01:00–04:00 and 06:00–10:00 UTC
 - **Off-peak hours:** the other 17 hours/day at the cheapest rate
 
-When a merge conflict needs AI resolution during a **peak hour**, the moistello bot
+When a merge conflict needs AI resolution during a **peak hour**, the deodes bot
 **waits until the next off-peak hour starts**, then runs opencode at the cheaper rate.
 Toggle this with `wait_for_off_peak` in `.github/bot-config.yml`.
 

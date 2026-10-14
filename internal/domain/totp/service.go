@@ -21,7 +21,7 @@ import (
 
 const (
 	// Issuer is the name shown in authenticator apps.
-	Issuer = "Moistello"
+	Issuer = "Deodes"
 	// BackupCodeCount is how many single-use recovery codes an enrollment gets.
 	BackupCodeCount = 10
 	// DefaultQRSize is the pixel width and height of provisioning QR images.

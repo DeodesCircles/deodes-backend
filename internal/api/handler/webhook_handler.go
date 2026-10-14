@@ -181,7 +181,7 @@ func NewIncomingWebhookHandler(repo webhook.WebhookRepository) *IncomingWebhookH
 // @Accept json
 // @Produce json
 // @Param id path string true "Webhook ID"
-// @Param X-Moistello-Signature header string true "HMAC-SHA256 hex signature"
+// @Param X-Deodes-Signature header string true "HMAC-SHA256 hex signature"
 // @Success 200 {object} response.Envelope
 // @Failure 400 {object} response.Envelope
 // @Failure 401 {object} response.Envelope
@@ -199,7 +199,7 @@ func (h *IncomingWebhookHandler) ReceiveWebhook(c *gin.Context) {
 		return
 	}
 
-	signature := c.GetHeader("X-Moistello-Signature")
+	signature := c.GetHeader("X-Deodes-Signature")
 	if signature == "" {
 		response.Unauthorized(c, "missing webhook signature")
 		return

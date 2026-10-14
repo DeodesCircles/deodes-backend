@@ -1,7 +1,7 @@
 # Specification: End-to-End Chat Encryption with X3DH & Double Ratchet
 
 ## 1. Overview
-This specification details the End-to-End Encryption (E2EE) design implemented for Moistello chat. It uses the **Extended Triple Diffie-Hellman (X3DH)** protocol for initial key agreement and an adaptation of the **Double Ratchet** protocol for forward secrecy and post-compromise security across message sessions.
+This specification details the End-to-End Encryption (E2EE) design implemented for Deodes chat. It uses the **Extended Triple Diffie-Hellman (X3DH)** protocol for initial key agreement and an adaptation of the **Double Ratchet** protocol for forward secrecy and post-compromise security across message sessions.
 
 ## 2. Key Architecture
 

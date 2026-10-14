@@ -190,7 +190,7 @@ func (p *MPesaProvider) InitiateOnramp(ctx context.Context, req OnrampRequest) (
 		"PhoneNumber":       req.PhoneNumber,
 		"CallBackURL":       p.cfg.CallbackBaseURL + "/webhooks/mpesa/stk-callback",
 		"AccountReference":  req.Reference,
-		"TransactionDesc":   "Moistello USDC on-ramp",
+		"TransactionDesc":   "Deodes USDC on-ramp",
 	}
 
 	var result struct {
@@ -218,7 +218,7 @@ func (p *MPesaProvider) InitiateOfframp(ctx context.Context, req OfframpRequest)
 		"Amount":             int64(req.Amount),
 		"PartyA":             p.cfg.Shortcode,
 		"PartyB":             req.PhoneNumber,
-		"Remarks":            "Moistello USDC off-ramp",
+		"Remarks":            "Deodes USDC off-ramp",
 		"QueueTimeOutURL":    p.cfg.CallbackBaseURL + "/webhooks/mpesa/b2c-timeout",
 		"ResultURL":          p.cfg.CallbackBaseURL + "/webhooks/mpesa/b2c-result",
 		"Occasion":           req.Reference,

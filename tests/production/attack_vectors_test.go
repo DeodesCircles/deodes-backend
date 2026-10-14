@@ -19,9 +19,9 @@ import (
 // ---------------------------------------------------------------------------
 // Governance Simulation Helpers
 //
-// These types simulate the Soroban governance contract in-process. The
+// These types simulate the governance contract in-process. The
 // governance contract uses token-weighted voting with configurable thresholds.
-// Actual on-chain enforcement is via Soroban host functions; here we model
+// Actual on-chain enforcement is via contract functions; here we model
 // the equivalent logic with pure Go assertions.
 // ---------------------------------------------------------------------------
 
@@ -1239,7 +1239,7 @@ func TestCircle_TierBasedEnforcement(t *testing.T) {
 		// the service layer currently does not enforce MOI score checks on
 		// Join (it only enforces member count, circle type, and duplicates).
 		// This test validates the error variable exists and the model supports
-		// the field, which is enforced on-chain via Soroban host functions.
+		// the field, which is enforced on-chain by the circle contract.
 		repo := new(circleMocks.Repository)
 		svc := circle.NewService(repo, nil, circle.Dependencies{})
 		ctx := context.Background()
@@ -1260,7 +1260,7 @@ func TestCircle_TierBasedEnforcement(t *testing.T) {
 		assert.NotNil(t, svc)
 
 		// Document the on-chain enforcement point
-		t.Log("MinMoiScore enforcement validated — enforced on-chain via Soroban contract")
+		t.Log("MinMoiScore enforcement validated — enforced on-chain by the circle contract")
 		_ = ctx
 		_ = svc
 	})
@@ -1269,7 +1269,7 @@ func TestCircle_TierBasedEnforcement(t *testing.T) {
 // ===========================================================================
 // TEST 10: Reentrancy Protection (Circle)
 //
-// ATTACK VECTOR: An attacker deploys a malicious Soroban contract that calls
+// ATTACK VECTOR: An attacker deploys a malicious contract that calls
 // the contribute function, and within its callback, calls contribute again
 // before the first completes. The ReentrancyGuard must detect and block
 // reentrant calls, preventing double-contribute and state corruption.
@@ -1345,8 +1345,8 @@ func TestCircle_ReentrancyGuard(t *testing.T) {
 
 	t.Run("concurrent_guard_is_not_reentrant_safe_by_design", func(t *testing.T) {
 		// NOTE: The simple ReentrancyGuard is NOT thread-safe — this is
-		// intentional for the Soroban environment where calls are sequential.
-		// Soroban host functions are single-threaded within a contract invocation.
+		// intentional for an EVM environment where calls are sequential.
+		// Contract invocations are single-threaded within one transaction.
 		guard := &ReentrancyGuard{}
 		err := guard.Enter()
 		require.NoError(t, err)
@@ -1375,7 +1375,7 @@ func TestCircle_ReentrancyGuard(t *testing.T) {
 
 		t.Logf("Concurrent reentrancy test (10 goroutines): %d blocked, %d allowed (non-atomic guard)",
 			failureCount, 10-failureCount)
-		t.Log("Note: Soroban environment is single-threaded per invocation — this guard is safe in production")
+		t.Log("Note: contract execution is single-threaded per invocation — this guard is safe in production")
 	})
 }
 

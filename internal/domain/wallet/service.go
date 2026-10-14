@@ -11,14 +11,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/stellar/go/clients/horizonclient"
-	"github.com/stellar/go/keypair"
 
 	"github.com/deodes/backend/pkg/arc"
 	"github.com/deodes/backend/pkg/crypto"
 	"github.com/deodes/backend/pkg/logger"
 	"github.com/deodes/backend/pkg/money"
-	"github.com/deodes/backend/pkg/stellar"
 )
 
 type Service interface {
@@ -26,7 +23,7 @@ type Service interface {
 	CreateWallet(ctx context.Context, userID string, passkeySeed []byte) (*Wallet, error)
 	// CreateHostedArcWallet derives, encrypts and persists a custodial Arc
 	// (EVM 0x) wallet under us. One hosted wallet per user (UNIQUE on
-	// user_id+wallet_type). Requires EncryptionKey; Stellar wallets stay
+	// user_id+wallet_type). Requires EncryptionKey; legacy wallets stay
 	// backward compatible without it.
 	CreateHostedArcWallet(ctx context.Context, userID string, passkeySeed []byte) (*Wallet, error)
 	// LinkWallet persists a self-custody Arc (EVM 0x) wallet link for userID.
@@ -47,16 +44,10 @@ type Service interface {
 }
 
 type Config struct {
-	MasterSecretKey   string
-	MasterPublicKey   string
-	HorizonURL        string
-	USDCIssuer        string
-	NetworkPassphrase string
-	MinBalanceXLM     float64
-	WalletPepper      string
-	Argon2Time        int
-	Argon2Memory      int
-	Argon2Threads     int
+	WalletPepper  string
+	Argon2Time    int
+	Argon2Memory  int
+	Argon2Threads int
 	// EncryptionKey is the hex-encoded 32-byte AES key for custodial secret
 	// storage (security.encryption_key, required in prod).
 	EncryptionKey string
@@ -67,28 +58,20 @@ type Config struct {
 }
 
 type service struct {
-	repo    Repository
-	cfg     Config
-	horizon *horizonclient.Client
-	master  *keypair.Full
-	arc     *arc.Client
+	repo Repository
+	cfg  Config
+	arc  *arc.Client
 }
 
 func NewService(repo Repository, cfg Config) (Service, error) {
-	masterKP, err := keypair.ParseFull(cfg.MasterSecretKey)
-	if err != nil {
-		return nil, fmt.Errorf("parsing master secret key: %w", err)
-	}
 	chainID := cfg.ArcChainID
 	if chainID == 0 {
 		chainID = arc.ChainIDTestnet
 	}
 	return &service{
-		repo:    repo,
-		cfg:     cfg,
-		horizon: horizonclient.DefaultTestNetClient,
-		master:  masterKP,
-		arc:     arc.NewClient(cfg.ArcRPCURL, chainID),
+		repo: repo,
+		cfg:  cfg,
+		arc:  arc.NewClient(cfg.ArcRPCURL, chainID),
 	}, nil
 }
 
@@ -105,18 +88,13 @@ func (s *service) CreateWallet(ctx context.Context, userID string, passkeySeed [
 		l.Error().Err(err).Str("userID", userID).Msg("invalid wallet seed input")
 		return nil, err
 	}
-	kp, err := keypair.FromRawSeed(rawSeed)
-	if err != nil {
-		l := logger.Ctx(ctx) // value receiver; bind before calling pointer methods
-		l.Error().Err(err).Str("userID", userID).Msg("failed to derive keypair")
-		return nil, err
-	}
+	_, addr := crypto.Ed25519AddressFromSeed(rawSeed)
 
 	walletID := uuid.New().String()
 	w := &Wallet{
 		ID:                 walletID,
 		UserID:             userID,
-		PublicKey:          kp.Address(),
+		PublicKey:          addr,
 		WalletType:         WalletTypeAuto,
 		IsPrimary:          true,
 		EncryptedSecretKey: []byte{},
@@ -139,15 +117,6 @@ func (s *service) CreateWallet(ctx context.Context, userID string, passkeySeed [
 			return nil, err
 		}
 	}
-
-	// Bounded async funding with context and timeout. The actual create-account
-	// transaction building, signing, and retry logic lives in pkg/stellar.
-	go func() {
-		bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		_ = s.fundAccountWithRetry(bgCtx, w.PublicKey)
-	}()
 
 	return w,
 		nil
@@ -268,24 +237,6 @@ func (s *service) GetWalletByAddress(ctx context.Context, address string) (*Wall
 	return w, nil
 }
 
-// fundAccountWithRetry best-effort funds a newly created wallet account from
-// the master pool. The service only orchestrates; the Stellar transaction
-// helpers (including retry/backoff) live in pkg/stellar.
-func (s *service) fundAccountWithRetry(ctx context.Context, address string) error {
-	startingBalance, err := money.FromFloat64(s.cfg.MinBalanceXLM)
-	if err != nil {
-		return fmt.Errorf("invalid wallet minimum balance: %w", err)
-	}
-	return stellar.FundAccountWithRetry(
-		ctx,
-		s.horizon,
-		s.master,
-		address,
-		startingBalance.String(),
-		s.cfg.NetworkPassphrase,
-	)
-}
-
 func (s *service) SignTransaction(ctx context.Context, walletID string, passkeySeed []byte, txnXDR string) (string, error) {
 	return "", nil
 }
@@ -318,25 +269,9 @@ func (s *service) GetBalance(ctx context.Context, userID string) (*Balance, erro
 			return &Balance{XLM: 0, USDC: f}, nil
 		}
 	}
-	// Legacy Stellar wallet: read on-chain balances via Horizon.
-	detail, err := s.horizon.AccountDetail(horizonclient.AccountRequest{AccountID: wallets[0].PublicKey})
-	if err != nil {
-		return nil, fmt.Errorf("reading Stellar account: %w", err)
-	}
-	bal := &Balance{}
-	for _, b := range detail.Balances {
-		f, err := strconv.ParseFloat(b.Balance, 64)
-		if err != nil {
-			continue
-		}
-		switch {
-		case b.Type == "native":
-			bal.XLM = f
-		case b.Code == "USDC":
-			bal.USDC = f
-		}
-	}
-	return bal, nil
+	// Legacy (non-0x) wallets predate the Arc migration: no chain left to
+	// read them from. Surface a migration error, not a chain call.
+	return nil, fmt.Errorf("legacy wallet %s is balance-unavailable post-migration (see Phase 2.11)", wallets[0].PublicKey)
 }
 
 func (s *service) SendPayment(ctx context.Context, userID string, passkeySeed []byte, destination, asset string, amount float64, memo, ipAddress, userAgent string) (string, error) {

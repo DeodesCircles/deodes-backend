@@ -21,11 +21,11 @@ func TestPostgresRepository_ListUsesOneAggregatedQuery(t *testing.T) {
 			require.NoError(t, err)
 			defer mockDB.Close()
 			repo := NewRepository(sqlx.NewDb(mockDB, "sqlmock"))
-			columns := []string{"id", "contract_id", "community_id", "name", "description", "circle_type", "payout_type", "contribution_amount", "currency", "frequency", "max_members", "min_moi_score", "collateral_percent", "late_fee_percent", "grace_period_hours", "max_strikes", "member_count", "requires_invite", "start_date", "end_date", "status", "current_round", "total_contributions", "organizer_id", "created_at", "updated_at"}
+			columns := []string{"id", "contract_id", "community_id", "name", "description", "circle_type", "payout_type", "contribution_amount", "currency", "frequency", "max_members", "min_moi_score", "collateral_percent", "late_fee_percent", "grace_period_hours", "max_strikes", "member_count", "requires_invite", "auto_debit", "start_date", "end_date", "status", "current_round", "total_contributions", "organizer_id", "created_at", "updated_at"}
 			rows := sqlmock.NewRows(columns)
 			now := time.Now()
 			for n := 0; n < size; n++ {
-				rows.AddRow(uuid.New(), nil, nil, fmt.Sprintf("circle-%d", n), nil, CircleTypePublic, PayoutTypeRandom, 10.0, CurrencyUSDC, FrequencyWeekly, 20, 0, 0.0, 0.0, 1, 3, n, false, nil, nil, CircleStatusActive, 1, 10.0, uuid.New(), now, now)
+				rows.AddRow(uuid.New(), nil, nil, fmt.Sprintf("circle-%d", n), nil, CircleTypePublic, PayoutTypeRandom, 10.0, CurrencyUSDC, FrequencyWeekly, 20, 0, 0.0, 0.0, 1, 3, n, false, false, nil, nil, CircleStatusActive, 1, 10.0, uuid.New(), now, now)
 			}
 			mock.ExpectQuery("LEFT JOIN \\(").WithArgs(20, 0).WillReturnRows(rows)
 			got, err := repo.List(context.Background(), CircleFilter{})

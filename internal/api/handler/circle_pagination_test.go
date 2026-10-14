@@ -3,6 +3,7 @@ package handler_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -26,9 +27,20 @@ type stubCircleService struct {
 	circle   *circle.Circle
 	members  []circle.CircleMember
 	isMember bool
+	// Optional per-id overrides (subscription tests): when set, Get serves
+	// by id and IsMember checks the user|id pair.
+	byID      map[string]*circle.Circle
+	memberSet map[string]bool
 }
 
 func (s *stubCircleService) Get(_ context.Context, id string) (*circle.Circle, error) {
+	if s.byID != nil {
+		c, ok := s.byID[id]
+		if !ok {
+			return nil, fmt.Errorf("circle not found")
+		}
+		return c, nil
+	}
 	return s.circle, nil
 }
 
@@ -192,7 +204,10 @@ func TestCircleHandler_GetRounds_AcceptsClientPaginationAndReturnsMeta(t *testin
 	assert.True(t, body.Meta.HasMore)
 }
 
-func (s *stubCircleService) IsMember(_ context.Context, _, _ string) (bool, error) {
+func (s *stubCircleService) IsMember(_ context.Context, circleID, userID string) (bool, error) {
+	if s.memberSet != nil {
+		return s.memberSet[userID+"|"+circleID], nil
+	}
 	return s.isMember, nil
 }
 

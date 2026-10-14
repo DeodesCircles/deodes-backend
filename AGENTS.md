@@ -1,6 +1,6 @@
-# Moistello Backend Conventions & Guidelines
+# Deodes Backend Conventions & Guidelines
 
-This document outlines core architectural guidelines, coding conventions, and static analysis rules for contributors and AI agents working on the `moistello-backend` codebase.
+This document outlines core architectural guidelines, coding conventions, and static analysis rules for contributors and AI agents working on the `deodes-backend` codebase.
 
 ---
 
@@ -19,7 +19,7 @@ This document outlines core architectural guidelines, coding conventions, and st
   - All missing or invalid configuration values are collected and returned as a unified error listing every problem at once.
   - Application entrypoints (`cmd/api-server`, `cmd/indexer`, `cmd/migrate`) log configuration errors with `log.Fatal` without goroutine stack dumps.
 - **Offline Configuration Preflight (`config-validate`)**:
-  - Use `moistello-api config-validate` (or `cmd/config-validate`) to perform offline preflight validation of configuration and secret formats (including JWT key parsing) without opening network connections.
+  - Use `deodes-api config-validate` (or `cmd/config-validate`) to perform offline preflight validation of configuration and secret formats (including JWT key parsing) without opening network connections.
 
 ---
 

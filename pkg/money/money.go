@@ -1,8 +1,13 @@
 // Package money provides a fixed-point monetary amount with seven decimal
-// places, matching the precision of Stellar assets (XLM and Stellar-issued
-// tokens such as USDC). All balance arithmetic in the codebase goes through
+// places. All balance arithmetic in the codebase goes through
 // this type so that units are never mixed: a Money value always represents
-// whole tokens, and its integer representation is always stroops.
+// whole tokens, and its integer representation is always minor units.
+//
+// UNIT NOTE (Phase 0.2 freeze, see docs/amount-units-freeze.md): Money
+// is 7-decimal. Arc EVM value is uint256 wei (18 decimals) and the USDC
+// ERC-20 interface is 6 decimals. NEVER convert minor units to wei by scaling
+// the int64 (1e11x error). Convert via decimal-string whole tokens first,
+// then use pkg/arc ERC20ToWei / WeiToERC20Units.
 package money
 
 import (
@@ -19,11 +24,11 @@ import (
 // Precision is the number of decimal places carried by Money.
 const Precision = 7
 
-// StroopsPerUnit is the number of stroops in one whole token.
-const StroopsPerUnit int64 = 10_000_000
+// MinorPerUnit is the number of minor units in one whole token.
+const MinorPerUnit int64 = 10_000_000
 
 var (
-	// ErrOverflow is returned when an operation does not fit in int64 stroops.
+	// ErrOverflow is returned when an operation does not fit in int64 minor units.
 	ErrOverflow = errors.New("money: arithmetic overflow")
 	// ErrInvalidAmount is returned when a string or float cannot be parsed
 	// into an exact amount.
@@ -33,21 +38,21 @@ var (
 )
 
 var (
-	maxStroops = big.NewInt(math.MaxInt64)
-	minStroops = big.NewInt(math.MinInt64)
+	maxMinor = big.NewInt(math.MaxInt64)
+	minMinor = big.NewInt(math.MinInt64)
 )
 
-// Money is an immutable amount of a single asset expressed in stroops.
+// Money is an immutable amount of a single asset expressed in minor units.
 // The zero value is a zero amount.
 type Money struct {
-	stroops int64
+	minor int64
 }
 
 // Zero returns a zero amount.
 func Zero() Money { return Money{} }
 
-// FromStroops builds a Money from an integer number of stroops.
-func FromStroops(stroops int64) Money { return Money{stroops: stroops} }
+// FromMinor builds a Money from an integer number of minor units.
+func FromMinor(minor int64) Money { return Money{minor: minor} }
 
 // FromString parses a decimal string such as "12.5" or "-0.0000001". At most
 // seven fractional digits are accepted; exponents, thousands separators and
@@ -106,8 +111,8 @@ func MustFromString(s string) Money {
 }
 
 // FromFloat64 converts a float amount of whole tokens to Money, rounding
-// half away from zero to the nearest stroop. NaN, infinities and values that
-// do not fit in int64 stroops are rejected.
+// half away from zero to the nearest minor unit. NaN, infinities and values that
+// do not fit in int64 minor units are rejected.
 func FromFloat64(f float64) (Money, error) {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
 		return Money{}, fmt.Errorf("%w: %v", ErrInvalidAmount, f)
@@ -126,18 +131,17 @@ func MustFromFloat64(f float64) Money {
 	return m
 }
 
-// Stroops returns the amount as an integer number of stroops.
-func (m Money) Stroops() int64 { return m.stroops }
+// Minor returns the amount as an integer number of minor units.
+func (m Money) Minor() int64 { return m.minor }
 
 // Float64 returns the amount as whole tokens. It is intended for display and
 // for legacy call sites that still carry float fields; never feed the result
 // back into arithmetic.
-func (m Money) Float64() float64 { return float64(m.stroops) / float64(StroopsPerUnit) }
+func (m Money) Float64() float64 { return float64(m.minor) / float64(MinorPerUnit) }
 
-// String renders the amount with exactly seven decimal places, the same
-// canonical form Horizon uses for balances and payment amounts.
+// String renders the amount with exactly seven decimal places.
 func (m Money) String() string {
-	s := m.stroops
+	s := m.minor
 	sign := ""
 	var abs uint64
 	if s < 0 {
@@ -146,26 +150,26 @@ func (m Money) String() string {
 	} else {
 		abs = uint64(s)
 	}
-	whole := abs / uint64(StroopsPerUnit)
-	frac := abs % uint64(StroopsPerUnit)
+	whole := abs / uint64(MinorPerUnit)
+	frac := abs % uint64(MinorPerUnit)
 	return fmt.Sprintf("%s%d.%07d", sign, whole, frac)
 }
 
 // IsZero reports whether the amount is zero.
-func (m Money) IsZero() bool { return m.stroops == 0 }
+func (m Money) IsZero() bool { return m.minor == 0 }
 
 // IsNegative reports whether the amount is below zero.
-func (m Money) IsNegative() bool { return m.stroops < 0 }
+func (m Money) IsNegative() bool { return m.minor < 0 }
 
 // IsPositive reports whether the amount is above zero.
-func (m Money) IsPositive() bool { return m.stroops > 0 }
+func (m Money) IsPositive() bool { return m.minor > 0 }
 
 // Cmp compares two amounts, returning -1, 0 or +1.
 func (m Money) Cmp(o Money) int {
 	switch {
-	case m.stroops < o.stroops:
+	case m.minor < o.minor:
 		return -1
-	case m.stroops > o.stroops:
+	case m.minor > o.minor:
 		return 1
 	default:
 		return 0
@@ -173,53 +177,53 @@ func (m Money) Cmp(o Money) int {
 }
 
 // Equal reports whether two amounts are identical.
-func (m Money) Equal(o Money) bool { return m.stroops == o.stroops }
+func (m Money) Equal(o Money) bool { return m.minor == o.minor }
 
 // Neg returns the negated amount.
 func (m Money) Neg() (Money, error) {
-	if m.stroops == math.MinInt64 {
+	if m.minor == math.MinInt64 {
 		return Money{}, ErrOverflow
 	}
-	return Money{stroops: -m.stroops}, nil
+	return Money{minor: -m.minor}, nil
 }
 
 // Add returns m + o, failing on int64 overflow.
 func (m Money) Add(o Money) (Money, error) {
-	sum := m.stroops + o.stroops
-	if (o.stroops > 0 && sum < m.stroops) || (o.stroops < 0 && sum > m.stroops) {
+	sum := m.minor + o.minor
+	if (o.minor > 0 && sum < m.minor) || (o.minor < 0 && sum > m.minor) {
 		return Money{}, ErrOverflow
 	}
-	return Money{stroops: sum}, nil
+	return Money{minor: sum}, nil
 }
 
 // Sub returns m - o, failing on int64 overflow.
 func (m Money) Sub(o Money) (Money, error) {
-	diff := m.stroops - o.stroops
-	if (o.stroops < 0 && diff < m.stroops) || (o.stroops > 0 && diff > m.stroops) {
+	diff := m.minor - o.minor
+	if (o.minor < 0 && diff < m.minor) || (o.minor > 0 && diff > m.minor) {
 		return Money{}, ErrOverflow
 	}
-	return Money{stroops: diff}, nil
+	return Money{minor: diff}, nil
 }
 
 // MulInt returns m * n, failing on int64 overflow.
 func (m Money) MulInt(n int64) (Money, error) {
-	return fromBig(new(big.Int).Mul(big.NewInt(m.stroops), big.NewInt(n)))
+	return fromBig(new(big.Int).Mul(big.NewInt(m.minor), big.NewInt(n)))
 }
 
 // MulDiv returns m * num / den computed exactly in big integers and rounded
-// half away from zero to the nearest stroop. It is the primitive for fees and
+// half away from zero to the nearest minor unit. It is the primitive for fees and
 // percentages: a 2.5% fee is MulDiv(25, 1000).
 func (m Money) MulDiv(num, den int64) (Money, error) {
 	if den == 0 {
 		return Money{}, ErrDivideByZero
 	}
-	prod := new(big.Int).Mul(big.NewInt(m.stroops), big.NewInt(num))
+	prod := new(big.Int).Mul(big.NewInt(m.minor), big.NewInt(num))
 	return fromBig(roundDiv(prod, big.NewInt(den)))
 }
 
 // Percent returns the given percentage of m. The percentage is taken to six
 // decimal places (so 12.345678% is exact) and the result is rounded half away
-// from zero to the nearest stroop.
+// from zero to the nearest minor unit.
 func (m Money) Percent(percent float64) (Money, error) {
 	if math.IsNaN(percent) || math.IsInf(percent, 0) {
 		return Money{}, fmt.Errorf("%w: percent %v", ErrInvalidAmount, percent)
@@ -244,7 +248,7 @@ func Sum(amounts ...Money) (Money, error) {
 }
 
 // Scan implements sql.Scanner. NUMERIC/DECIMAL columns arrive as text and are
-// parsed exactly; integer columns are interpreted as stroops.
+// parsed exactly; integer columns are interpreted as minor units.
 func (m *Money) Scan(src any) error {
 	switch v := src.(type) {
 	case nil:
@@ -263,7 +267,7 @@ func (m *Money) Scan(src any) error {
 		}
 		*m = parsed
 	case int64:
-		*m = FromStroops(v)
+		*m = FromMinor(v)
 	case float64:
 		parsed, err := FromFloat64(v)
 		if err != nil {
@@ -321,10 +325,10 @@ func (m *Money) UnmarshalJSON(data []byte) error {
 }
 
 func fromBig(v *big.Int) (Money, error) {
-	if v.Cmp(maxStroops) > 0 || v.Cmp(minStroops) < 0 {
+	if v.Cmp(maxMinor) > 0 || v.Cmp(minMinor) < 0 {
 		return Money{}, ErrOverflow
 	}
-	return Money{stroops: v.Int64()}, nil
+	return Money{minor: v.Int64()}, nil
 }
 
 // roundDiv divides num by den rounding half away from zero.

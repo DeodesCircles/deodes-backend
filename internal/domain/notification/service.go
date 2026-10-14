@@ -12,7 +12,7 @@ import (
 )
 
 // EventsExchange is the topic exchange notification events are published to.
-const EventsExchange = "moistello.events"
+const EventsExchange = "deodes.events"
 
 // Publisher abstracts the RabbitMQ producer so the service can be tested
 // with a mock. *rabbitmq.Client satisfies it.

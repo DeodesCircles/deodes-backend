@@ -1,0 +1,19 @@
+# 2026/10/13 12:11:05.932666 [TestLateFee_Property_RoundTrip] [rapid] draw contribution: 11.999969482421875
+# 2026/10/13 12:11:05.932686 [TestLateFee_Property_RoundTrip] [rapid] draw percent: 1.0078125
+# 2026/10/13 12:11:05.932695 [TestLateFee_Property_RoundTrip] LateFee(11.999969482421875, 1.0078125) = 0.1209373, want ≈ 0.12093719244003295
+# 
+v0.4.8#5854372948742538431
+0x0
+0x0
+0x38e38e38e38e4
+0x3
+0x3
+0xf
+0x1fffc00000000
+0x0
+0x0
+0x0
+0x0
+0x0
+0x7
+0x200000000000

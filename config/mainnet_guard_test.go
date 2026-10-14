@@ -7,28 +7,19 @@ import (
 )
 
 // mainnetCleanConfig returns a config that must pass the mainnet guard: Arc
-// mainnet values, keeper escrow set, non-testnet contracts, Stellar mainnet.
+// mainnet values with keeper escrow set and distinct from the treasury.
 func mainnetCleanConfig() *Config {
 	return &Config{
 		Environment: "production",
-		Stellar: StellarConfig{
-			Network:           "mainnet",
-			HorizonURL:        "https://horizon.stellar.org",
-			SorobanRPCURL:     "https://soroban-mainnet.stellar.org",
-			NetworkPassphrase: "Public Global Stellar Network ; September 2015",
-			USDCIssuer:        "GBUQWP3BOUZX34ULNQG23RQ6F4YUSXHTQSXUSMIQ375YRKBY2S27425",
-		},
 		Arc: ArcConfig{
-			RPCURL:       "https://rpc.mainnet.arc.io",
-			ChainID:      5042,
-			USDCContract: "0x3600000000000000000000000000000000000000",
+			RPCURL:          "https://rpc.mainnet.arc.io",
+			ChainID:         5042,
+			USDCContract:    "0x3600000000000000000000000000000000000000",
+			TreasuryAddress: "0x2222222222222222222222222222222222222222",
 		},
 		Keeper: KeeperConfig{
 			EscrowAddress: "0x1111111111111111111111111111111111111111",
 			IntervalMin:   15,
-		},
-		Contracts: map[string]string{
-			"circle_factory": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 		},
 	}
 }
@@ -38,13 +29,6 @@ func mainnetCleanConfig() *Config {
 func devTestnetConfig() *Config {
 	return &Config{
 		Environment: "development",
-		Stellar: StellarConfig{
-			Network:           "testnet",
-			HorizonURL:        "https://horizon-testnet.stellar.org",
-			SorobanRPCURL:     "https://soroban-testnet.stellar.org",
-			NetworkPassphrase: "Test SDF Network ; September 2015",
-			USDCIssuer:        "GAX23V3WWDPPR5WRER3KTEUTDLSCGZYMSJY5FDRRKKCIQ4JADF5T27RC",
-		},
 		Arc: ArcConfig{
 			RPCURL:       "",
 			ChainID:      5042002,
@@ -53,9 +37,6 @@ func devTestnetConfig() *Config {
 		Keeper: KeeperConfig{
 			EscrowAddress: "",
 			IntervalMin:   15,
-		},
-		Contracts: map[string]string{
-			"circle_factory": "CADZWDGER6PYEWVHZDZ5HMEV6A5TKFVD4EY4DSPUTEKAM2KDPEABGJQU",
 		},
 	}
 }
@@ -74,26 +55,11 @@ func TestCheckMainnetIssues_FullMainnetCleanPasses(t *testing.T) {
 	require.Empty(t, checkMainnetIssues(mainnetCleanConfig()))
 }
 
-func TestCheckMainnetIssues_StellarMainnetFlagsTestnetRemnants(t *testing.T) {
-	cfg := mainnetCleanConfig()
-	cfg.Stellar.HorizonURL = "https://horizon-testnet.stellar.org"
-	cfg.Stellar.SorobanRPCURL = "https://soroban-testnet.stellar.org"
-	cfg.Stellar.NetworkPassphrase = "Test SDF Network ; September 2015"
-	cfg.Stellar.USDCIssuer = "GAX23V3WWDPPR5WRER3KTEUTDLSCGZYMSJY5FDRRKKCIQ4JADF5T27RC"
-
-	issues := checkMainnetIssues(cfg)
-	require.Contains(t, issues, "horizon_url still set to testnet")
-	require.Contains(t, issues, "soroban_rpc_url still set to testnet")
-	require.Contains(t, issues, "network_passphrase still set to testnet")
-	require.Contains(t, issues, "usdc_issuer still set to testnet")
-}
-
-func TestCheckMainnetIssues_ProductionEnvTriggersWithoutStellarMainnet(t *testing.T) {
+func TestCheckMainnetIssues_ProductionEnvTriggers(t *testing.T) {
 	cfg := mainnetCleanConfig()
 	cfg.Environment = "production"
-	cfg.Stellar.Network = "testnet" // legacy Stellar untouched: no stellar issues...
 	issues := checkMainnetIssues(cfg)
-	require.Empty(t, issues) // ...and Arc/Keeper/contracts are mainnet-clean.
+	require.Empty(t, issues) // Arc/Keeper clean.
 
 	cfg.Arc.ChainID = 5042002 // ...but a testnet Arc chain ID must fail.
 	issues = checkMainnetIssues(cfg)
@@ -173,19 +139,19 @@ func TestCheckMainnetIssues_KeeperEscrowOptionalWhenDisabled(t *testing.T) {
 	require.Empty(t, checkMainnetIssues(cfg))
 }
 
-func TestCheckMainnetIssues_TestnetContractsRejected(t *testing.T) {
+func TestCheckMainnetIssues_KeeperEscrowMustDifferFromTreasury(t *testing.T) {
 	cfg := mainnetCleanConfig()
-	cfg.Contracts = map[string]string{
-		"circle_factory":      "CADZWDGER6PYEWVHZDZ5HMEV6A5TKFVD4EY4DSPUTEKAM2KDPEABGJQU",
-		"governance_token":    "CDOBQSJZJD4RIE2V5Q2IOJ6PBPSE2FT46BCD5WXW64ZN4KEUMYGBX3CS",
-		"treasury":            "CMAINNETTREASURYVALUEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
-		"reputation_registry": "  CCEEJKQCYO7CXBFZBSGHS6AK2CCBU2HY2HK4VXQDPZ3XX3X3KEDGXQ7K  ",
-	}
+	cfg.Keeper.EscrowAddress = cfg.Arc.TreasuryAddress
 	issues := checkMainnetIssues(cfg)
-	require.Len(t, issues, 3)
-	require.Contains(t, issues, "contracts.circle_factory still set to testnet value")
-	require.Contains(t, issues, "contracts.governance_token still set to testnet value")
-	require.Contains(t, issues, "contracts.reputation_registry still set to testnet value")
+	require.Len(t, issues, 1)
+	require.Contains(t, issues[0], "keeper.escrow_address must differ from arc.treasury_address")
+}
+
+func TestCheckMainnetIssues_NoStaleContractIDs(t *testing.T) {
+	// Purged rail: no contract-ID registry remains to check. This test pins
+	// that no Contracts map can sneak back in unnoticed.
+	cfg := mainnetCleanConfig()
+	require.Empty(t, checkMainnetIssues(cfg))
 }
 
 func TestCheckMainnetIssues_MultipleArcIssuesAllReported(t *testing.T) {

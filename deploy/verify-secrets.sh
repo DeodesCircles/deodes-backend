@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Pre-deploy secrets validation for Moistello
+# Pre-deploy secrets validation for Deodes
 # Ensure all required secrets are present and in correct format
 # Exit code 0 = ready to deploy, non-zero = blocked
 
@@ -11,7 +11,6 @@ REQUIRED_SECRETS=(
   "WALLET_PEPPER"
   "PASSKEY_PEPPER"
   "ENCRYPTION_KEY"
-  "STELLAR_MASTER_SECRET"
   "REDIS_PASSWORD"
   "DB_PASSWORD"
   "ADMIN_API_KEY"
@@ -71,11 +70,6 @@ fi
 
 if ! [[ ${WEBHOOK_SECRET:-} =~ ^[0-9a-f]{64}$ ]]; then
   INVALID+=("WEBHOOK_SECRET: not 64-char hex")
-fi
-
-# Stellar secret should start with S
-if ! [[ ${STELLAR_MASTER_SECRET:-} =~ ^S[A-Z0-9]{55}$ ]]; then
-  INVALID+=("STELLAR_MASTER_SECRET: invalid Stellar secret format")
 fi
 
 # Passwords should be reasonably long

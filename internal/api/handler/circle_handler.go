@@ -365,10 +365,8 @@ type PayoutPreviewResponse struct {
 	TotalGrossAmount   float64                 `json:"totalGrossAmount"`
 	TotalNetAmount     float64                 `json:"totalNetAmount"`
 	ProtocolFee        float64                 `json:"protocolFee"`
-	StellarFeeEstimate float64                 `json:"stellarFeeEstimate"`
 	// ArcFeeEstimate is the estimated Arc network fee in USDC (USDC is gas,
-	// 18 decimals, 20 Gwei floor). Kept alongside StellarFeeEstimate for
-	// backward compatibility during the Stellar -> Arc migration.
+	// 18 decimals, 20 Gwei floor).
 	ArcFeeEstimate float64 `json:"arcFeeEstimate"`
 	Recipients     []RecipientDistribution `json:"recipients"`
 	DryRun         bool                    `json:"dryRun"`
@@ -421,8 +419,6 @@ func (h *CircleHandler) buildPayoutPreview(cir *circle.Circle, reqAmount *float6
 		net = 0
 	}
 
-	// 100 stroops (0.00001 XLM) base fee per Stellar payment operation
-	stellarFeeEstimate := 0.00001
 	// Arc network fee estimate in USDC (USDC is gas, ~$0.001 per tx).
 	arcFeeEstimate := 0.001
 
@@ -433,7 +429,6 @@ func (h *CircleHandler) buildPayoutPreview(cir *circle.Circle, reqAmount *float6
 		TotalGrossAmount:   gross,
 		TotalNetAmount:     net,
 		ProtocolFee:        protocolFee,
-		StellarFeeEstimate: stellarFeeEstimate,
 		ArcFeeEstimate:     arcFeeEstimate,
 		Recipients: []RecipientDistribution{
 			{
@@ -521,7 +516,7 @@ func (h *CircleHandler) PreviewPayout(c *gin.Context) {
 }
 
 // TriggerPayout records the payout for an active circle. Payout submission to
-// Stellar remains upstream of this endpoint; txnHash is the on-chain receipt.
+// Arc remains upstream of this endpoint; txnHash is the on-chain receipt.
 // If ?dry_run=true or body.dryRun=true is provided, returns the distribution preview without executing.
 func (h *CircleHandler) TriggerPayout(c *gin.Context) {
 	circleID := c.Param("id")
@@ -808,7 +803,7 @@ func (h *CircleHandler) Contribute(c *gin.Context) {
 		response.ValidationErrors(c, "validation failed: "+err.Error())
 		return
 	}
-	// Arc USDC only: the EVM tx hash is always 0x + 64 hex. Stellar-style
+	// Arc USDC only: the EVM tx hash is always 0x + 64 hex. Legacy-style
 	// hashes are rejected here so a wrong-rail submission fails fast with a
 	// 422 instead of being recorded as perpetually-pending.
 	if !isArcTxHash(req.TxnHash) {
@@ -838,7 +833,7 @@ func (h *CircleHandler) Contribute(c *gin.Context) {
 		return
 	}
 	// The round payment must equal the circle's configured amount (within a
-	// stroop of tolerance for float transport). Under/over-payments are a
+	// minor unit of tolerance for float transport). Under/over-payments are a
 	// 422 so the member can retry with the exact figure.
 	if math.Abs(req.Amount-cir.ContributionAmount) > 0.0000001 {
 		response.ValidationErrors(c, fmt.Sprintf("amount must equal the circle contribution amount of %v USDC", cir.ContributionAmount))

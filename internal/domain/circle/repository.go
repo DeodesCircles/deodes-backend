@@ -33,6 +33,8 @@ type Repository interface {
 	GetMembers(ctx context.Context, circleID uuid.UUID) ([]CircleMember, error)
 	GetMemberCount(ctx context.Context, circleID uuid.UUID) (int, error)
 	UpdateMemberStatus(ctx context.Context, circleID, userID uuid.UUID, status MemberStatus) error
+	// UpdateMemberStrikes persists the 2.7 strike counter.
+	UpdateMemberStrikes(ctx context.Context, circleID, userID uuid.UUID, strikes int) error
 	FindMemberByCircleAndUser(ctx context.Context, circleID, userID uuid.UUID) (*CircleMember, error)
 	FindCirclesByUserID(ctx context.Context, userID uuid.UUID) ([]Circle, error)
 

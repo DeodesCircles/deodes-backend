@@ -3,12 +3,12 @@
 ## Overview
 The `/metrics` endpoint and administrative operational interfaces are protected by an `X-Admin-API-Key` header check (`middleware.AdminAPIKeyMiddleware`). 
 
-To eliminate coordinated downtime when rotating admin credentials, Moistello supports **dual admin keys** (`auth.admin_api_key` and `auth.admin_api_key_secondary`). Both keys are independently valid, and every authenticated request emits an audit log and metrics label indicating which key identity (`primary` or `secondary`) was presented.
+To eliminate coordinated downtime when rotating admin credentials, Deodes supports **dual admin keys** (`auth.admin_api_key` and `auth.admin_api_key_secondary`). Both keys are independently valid, and every authenticated request emits an audit log and metrics label indicating which key identity (`primary` or `secondary`) was presented.
 
 ---
 
 ## Metric & Audit Observability
-- Metric: `moistello_admin_key_requests_total{identity="primary|secondary"}`
+- Metric: `deodes_admin_key_requests_total{identity="primary|secondary"}`
 - Request Context: `adminKeyIdentity` (`primary` or `secondary`)
 - Debug Log: `authenticated with [primary|secondary] admin API key`
 
@@ -21,7 +21,7 @@ To eliminate coordinated downtime when rotating admin credentials, Moistello sup
    ```bash
    openssl rand -hex 32
    ```
-2. Configure the new secret as `MOISTELLO_AUTH_ADMIN_API_KEY_SECONDARY` (or `ADMIN_API_KEY_SECONDARY`).
+2. Configure the new secret as `DEODES_AUTH_ADMIN_API_KEY_SECONDARY` (or `ADMIN_API_KEY_SECONDARY`).
 3. Deploy or reload the API server.
 4. Verify the server is running and both keys are accepted.
 
@@ -29,13 +29,13 @@ To eliminate coordinated downtime when rotating admin credentials, Moistello sup
 1. Update monitoring scrapers (e.g., Prometheus scraper jobs, Datadog agents, health probes) to use the new secondary key in the `X-Admin-API-Key` header.
 2. Monitor metrics in Grafana / Prometheus:
    ```promql
-   sum by (identity) (rate(moistello_admin_key_requests_total[5m]))
+   sum by (identity) (rate(deodes_admin_key_requests_total[5m]))
    ```
 3. Confirm that traffic on `identity="primary"` drops to zero and traffic on `identity="secondary"` matches total scraper volume.
 
 ### Phase 3: Promote Secondary Key to Primary
-1. Set `MOISTELLO_AUTH_ADMIN_API_KEY` to the value of the new secret.
-2. Unset or clear `MOISTELLO_AUTH_ADMIN_API_KEY_SECONDARY`.
+1. Set `DEODES_AUTH_ADMIN_API_KEY` to the value of the new secret.
+2. Unset or clear `DEODES_AUTH_ADMIN_API_KEY_SECONDARY`.
 3. Deploy or reload the API server.
 4. Verify that requests continue succeeding under `identity="primary"`.
 

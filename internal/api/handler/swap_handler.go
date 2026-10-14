@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"errors"
 	"strconv"
 
-	"github.com/gin-gonic/gin"
 	"github.com/deodes/backend/internal/domain/swap"
+	"github.com/deodes/backend/pkg/apperrors"
 	"github.com/deodes/backend/pkg/response"
+	"github.com/gin-gonic/gin"
 )
 
 type SwapHandler struct {
@@ -16,6 +18,17 @@ func NewSwapHandler(swapService *swap.Service) *SwapHandler {
 	return &SwapHandler{
 		swapService: swapService,
 	}
+}
+
+// swapError maps a missing on-chain escrow client to 503 (purged rail —
+// retryable by operations, not a client bug); everything else keeps the
+// existing 400 mapping.
+func swapError(c *gin.Context, err error) {
+	if errors.Is(err, apperrors.ErrChainDisabled) {
+		response.ErrorWithCode(c, 503, "escrow_unavailable", "on-chain escrow unavailable")
+		return
+	}
+	response.BadRequest(c, err.Error())
 }
 
 // CreateSwapOffer godoc
@@ -50,7 +63,7 @@ func (h *SwapHandler) CreateSwapOffer(c *gin.Context) {
 
 	offer, err := h.swapService.CreateSwapOffer(c.Request.Context(), userID.(string), req)
 	if err != nil {
-		response.BadRequest(c, err.Error())
+		swapError(c, err)
 		return
 	}
 
@@ -85,7 +98,7 @@ func (h *SwapHandler) AcceptSwapOffer(c *gin.Context) {
 
 	offer, err := h.swapService.AcceptSwapOffer(c.Request.Context(), userID.(string), req.SwapOfferID)
 	if err != nil {
-		response.BadRequest(c, err.Error())
+		swapError(c, err)
 		return
 	}
 
@@ -119,7 +132,7 @@ func (h *SwapHandler) CancelSwapOffer(c *gin.Context) {
 
 	offer, err := h.swapService.CancelSwapOffer(c.Request.Context(), userID.(string), req.SwapOfferID)
 	if err != nil {
-		response.BadRequest(c, err.Error())
+		swapError(c, err)
 		return
 	}
 

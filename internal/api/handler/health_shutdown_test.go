@@ -13,7 +13,7 @@ import (
 
 func TestHealthHandler_ReadinessFailsFastDuringShutdown(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	h := handler.NewHealthHandler(nil, nil, "", "")
+	h := handler.NewHealthHandler(nil, nil)
 	r := gin.New()
 	r.GET("/health/ready", h.Readiness)
 	r.GET("/health/live", h.Liveness)

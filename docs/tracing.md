@@ -1,7 +1,7 @@
 # Tracing
 
 OpenTelemetry traces cover the request pipeline: HTTP handlers, database work,
-and Stellar RPC calls, correlated to the request ID that the logs already carry.
+and Arc chain RPC calls, correlated to the request ID that the logs already carry.
 
 ## Configuration
 
@@ -33,7 +33,7 @@ that `otelgin` maintains.
 | `http.<service>` (root, per request) | `middleware.TracingMiddleware` via `otelgin` |
 | `db.transaction` | `postgres.WithTransaction`, `WithTransactionLevel`, `Transactor.WithTransaction` |
 | `db.<operation>` | `tracing.WithDBSpan` / `tracing.StartDBSpan` at repository call sites |
-| `stellar.<operation>` | Soroban RPC clients (`getEvents`, `getLedgerEntries`) |
+| `chain.<operation>` | Arc RPC clients via `tracing.StartChainSpan` |
 | `redis.<operation>` | Redis call sites via `tracing.StartRedisSpan` |
 | `http.<operation>` (outbound) | external HTTP calls via `tracing.StartHTTPSpan` |
 
@@ -76,7 +76,7 @@ attribute is caught at review rather than in production.
 - Span attributes are static per call site. Per-row detail (a specific user ID,
   a full SQL statement with bound values) is deliberately not recorded, so a
   trace shows which queries ran and how slow they were, not what they returned.
-- The RPC URL is not recorded at all on Stellar spans, so a trace shows the
+- The RPC URL is not recorded at all on chain spans, so a trace shows the
   operation but not which node served it. Add it through `tracing.SafeURL` if
   that becomes necessary.
 - `WithTransaction` cannot attribute a span to a logical operation, only to the

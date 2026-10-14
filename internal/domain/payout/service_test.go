@@ -15,7 +15,7 @@ import (
 
 func TestPayoutService_Record_Success(t *testing.T) {
 	repo := new(payoutMocks.Repository)
-	svc := payout.NewService(repo, nil, nil, nil)
+	svc := payout.NewService(repo, nil, nil)
 	ctx := context.Background()
 
 	input := payout.RecordInput{
@@ -35,7 +35,7 @@ func TestPayoutService_Record_Success(t *testing.T) {
 		return p.Amount == 500.0 &&
 			p.PayoutType == payout.PayoutTypeFixed &&
 			p.VerifiedOnchain == false &&
-			p.VerificationStatus == payout.VerificationStatusUnverified
+			p.VerificationStatus == payout.VerificationStatusPending
 	})).Return(nil)
 
 	p, err := svc.Record(ctx, input)
@@ -43,14 +43,14 @@ func TestPayoutService_Record_Success(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, p)
 	assert.False(t, p.VerifiedOnchain)
-	assert.Equal(t, payout.VerificationStatusUnverified, p.VerificationStatus)
+	assert.Equal(t, payout.VerificationStatusPending, p.VerificationStatus)
 	assert.Equal(t, 500.0, p.Amount)
 	repo.AssertExpectations(t)
 }
 
 func TestPayoutService_Record_VerifiedOnchain(t *testing.T) {
 	repo := new(payoutMocks.Repository)
-	svc := payout.NewService(repo, nil, nil, nil)
+	svc := payout.NewService(repo, nil, nil)
 	ctx := context.Background()
 
 	verifiedTrue := true
@@ -86,7 +86,7 @@ func TestPayoutService_Record_VerifiedOnchain(t *testing.T) {
 
 func TestPayoutService_UpdateVerification(t *testing.T) {
 	repo := new(payoutMocks.Repository)
-	svc := payout.NewService(repo, nil, nil, nil)
+	svc := payout.NewService(repo, nil, nil)
 	ctx := context.Background()
 	payoutID := uuid.New()
 
@@ -99,7 +99,7 @@ func TestPayoutService_UpdateVerification(t *testing.T) {
 
 func TestPayoutService_GetUserHistory(t *testing.T) {
 	repo := new(payoutMocks.Repository)
-	svc := payout.NewService(repo, nil, nil, nil)
+	svc := payout.NewService(repo, nil, nil)
 	ctx := context.Background()
 	userID := uuid.New()
 
@@ -117,7 +117,7 @@ func TestPayoutService_GetUserHistory(t *testing.T) {
 
 func TestPayoutService_GetCircleHistory(t *testing.T) {
 	repo := new(payoutMocks.Repository)
-	svc := payout.NewService(repo, nil, nil, nil)
+	svc := payout.NewService(repo, nil, nil)
 	ctx := context.Background()
 	circleID := uuid.New()
 
@@ -135,7 +135,7 @@ func TestPayoutService_GetCircleHistory(t *testing.T) {
 
 func TestPayoutService_Record_RejectsSecondPayoutForSameRound(t *testing.T) {
 	repo := new(payoutMocks.Repository)
-	svc := payout.NewService(repo, nil, nil, nil)
+	svc := payout.NewService(repo, nil, nil)
 	ctx := context.Background()
 
 	circleID := uuid.New()
@@ -185,7 +185,7 @@ func TestPayoutService_Record_RejectsInvalidAmounts(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := new(payoutMocks.Repository)
-			svc := payout.NewService(repo, nil, nil, nil)
+			svc := payout.NewService(repo, nil, nil)
 			got, err := svc.Record(ctx, tc.input)
 			assert.Error(t, err)
 			assert.Nil(t, got)
@@ -200,7 +200,7 @@ func TestPayoutService_GetRoundPayout(t *testing.T) {
 
 	t.Run("returns existing round payout", func(t *testing.T) {
 		repo := new(payoutMocks.Repository)
-		svc := payout.NewService(repo, nil, nil, nil)
+		svc := payout.NewService(repo, nil, nil)
 		existing := &payout.Payout{ID: uuid.New(), CircleID: circleID, RoundNumber: 2}
 		repo.On("FindByCircleAndRound", ctx, circleID, 2).Return(existing, nil)
 
@@ -212,7 +212,7 @@ func TestPayoutService_GetRoundPayout(t *testing.T) {
 
 	t.Run("returns nil when round is unpaid", func(t *testing.T) {
 		repo := new(payoutMocks.Repository)
-		svc := payout.NewService(repo, nil, nil, nil)
+		svc := payout.NewService(repo, nil, nil)
 		repo.On("FindByCircleAndRound", ctx, circleID, 3).Return(nil, apperrors.ErrNotFound)
 
 		got, err := svc.GetRoundPayout(ctx, circleID.String(), 3)
@@ -223,7 +223,7 @@ func TestPayoutService_GetRoundPayout(t *testing.T) {
 
 	t.Run("rejects invalid circle id", func(t *testing.T) {
 		repo := new(payoutMocks.Repository)
-		svc := payout.NewService(repo, nil, nil, nil)
+		svc := payout.NewService(repo, nil, nil)
 		got, err := svc.GetRoundPayout(ctx, "not-a-uuid", 1)
 		assert.Error(t, err)
 		assert.Nil(t, got)

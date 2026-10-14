@@ -110,7 +110,7 @@ func TestPayoutService_Record_RandomRejectsRepeatRecipient(t *testing.T) {
 	repo := new(payoutMocks.Repository)
 	ctx := context.Background()
 	circ := rotationTestCircle()
-	svc := payout.NewService(repo, nil, nil, &stubRotationCircleService{circ: circ, member: true})
+	svc := payout.NewService(repo, nil, &stubRotationCircleService{circ: circ, member: true})
 
 	circleID := circ.ID
 	repeatRecipient := uuid.New()
@@ -142,7 +142,7 @@ func TestPayoutService_Record_RandomAllowsUnpaidRecipient(t *testing.T) {
 	repo := new(payoutMocks.Repository)
 	ctx := context.Background()
 	circ := rotationTestCircle()
-	svc := payout.NewService(repo, nil, nil, &stubRotationCircleService{circ: circ, member: true})
+	svc := payout.NewService(repo, nil, &stubRotationCircleService{circ: circ, member: true})
 
 	circleID := circ.ID
 	freshRecipient := uuid.New()
@@ -179,7 +179,7 @@ func TestPayoutService_Record_NonRandomAllowsRepeatRecipient(t *testing.T) {
 	ctx := context.Background()
 	circ := rotationTestCircle()
 	circ.PayoutType = circle.PayoutTypeFixed
-	svc := payout.NewService(repo, nil, nil, &stubRotationCircleService{circ: circ, member: true})
+	svc := payout.NewService(repo, nil, &stubRotationCircleService{circ: circ, member: true})
 
 	circleID := circ.ID
 	recipient := uuid.New()

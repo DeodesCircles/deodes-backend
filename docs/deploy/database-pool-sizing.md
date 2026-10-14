@@ -1,7 +1,7 @@
 # PostgreSQL Connection Pool Sizing & Metrics Guide
 
 ## Overview
-Proper connection pool sizing prevents connection exhaustion under peak traffic while avoiding wasted PostgreSQL backend resources during idle periods. Moistello exposes full pool stats to Prometheus and checks pool configuration during startup.
+Proper connection pool sizing prevents connection exhaustion under peak traffic while avoiding wasted PostgreSQL backend resources during idle periods. Deodes exposes full pool stats to Prometheus and checks pool configuration during startup.
 
 ---
 
@@ -25,8 +25,8 @@ When using PgBouncer in transaction pooling mode:
 - PgBouncer maintains a compact server pool to the real database (e.g., `default_pool_size = 20-40`).
 - Best for high-concurrency stateless microservices and auto-scaling workloads.
 
-### 3. Primary with Read Replica (`MOISTELLO_DATABASE_REPLICA_URL`)
-Moistello routes analytics and reporting queries (`admin.metrics`, `admin.daily_volume`) to a read replica via `postgres.NewReader`.
+### 3. Primary with Read Replica (`DEODES_DATABASE_REPLICA_URL`)
+Deodes routes analytics and reporting queries (`admin.metrics`, `admin.daily_volume`) to a read replica via `postgres.NewReader`.
 - **Primary Pool**: Dedicated to OLTP transactions (circles, contributions, payouts, wallets). Sized based on write concurrency.
 - **Replica Pool**: Dedicated to read-heavy analytics. Prevents long-running analytical queries from starving transaction pools.
 
@@ -38,15 +38,15 @@ The following Prometheus metrics are exported by `pkg/postgres/pool_monitor.go`:
 
 | Metric Name | Type | Description |
 |---|---|---|
-| `moistello_db_pool_utilization{type="open"}` | Gauge | Current open connections (in use + idle). |
-| `moistello_db_pool_utilization{type="in_use"}` | Gauge | Connections currently active in queries/transactions. |
-| `moistello_db_pool_utilization{type="idle"}` | Gauge | Idle connections waiting in pool. |
-| `moistello_db_pool_utilization{type="max_open"}` | Gauge | Maximum allowed open connections. |
-| `moistello_db_pool_utilization{type="saturation"}` | Gauge | Pool saturation ratio (`in_use / max_open`). |
-| `moistello_db_pool_wait_total` | Counter | Cumulative number of times a goroutine had to wait for a connection. |
-| `moistello_db_pool_wait_seconds_total` | Counter | Total wait time in seconds spent acquiring connections. |
-| `moistello_db_idle_in_transaction_connections` | Gauge | Connections stuck idle in a transaction beyond threshold (leaks). |
-| `moistello_db_pool_alerts_total{kind="..."}` | Counter | Total pool alerts (`pool_saturated`, `idle_in_transaction`). |
+| `deodes_db_pool_utilization{type="open"}` | Gauge | Current open connections (in use + idle). |
+| `deodes_db_pool_utilization{type="in_use"}` | Gauge | Connections currently active in queries/transactions. |
+| `deodes_db_pool_utilization{type="idle"}` | Gauge | Idle connections waiting in pool. |
+| `deodes_db_pool_utilization{type="max_open"}` | Gauge | Maximum allowed open connections. |
+| `deodes_db_pool_utilization{type="saturation"}` | Gauge | Pool saturation ratio (`in_use / max_open`). |
+| `deodes_db_pool_wait_total` | Counter | Cumulative number of times a goroutine had to wait for a connection. |
+| `deodes_db_pool_wait_seconds_total` | Counter | Total wait time in seconds spent acquiring connections. |
+| `deodes_db_idle_in_transaction_connections` | Gauge | Connections stuck idle in a transaction beyond threshold (leaks). |
+| `deodes_db_pool_alerts_total{kind="..."}` | Counter | Total pool alerts (`pool_saturated`, `idle_in_transaction`). |
 
 ---
 

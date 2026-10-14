@@ -48,7 +48,7 @@ func TestRedisBridge_PublishesToHub(t *testing.T) {
 		"payload": json.RawMessage(payload),
 	})
 
-	err = rdb.Publish(context.Background(), "moistello_ws_events", env).Err()
+	err = rdb.Publish(context.Background(), "deodes_ws_events", env).Err()
 	require.NoError(t, err)
 
 	time.Sleep(50 * time.Millisecond)

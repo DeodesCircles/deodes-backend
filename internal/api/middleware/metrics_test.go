@@ -19,7 +19,7 @@ func TestPrometheusMiddleware_RecordsMetrics(t *testing.T) {
 	// Initialize vector metrics with sample observations/values so prometheus gatherer includes them
 	metrics.WSActiveConnections.Set(1)
 	metrics.DBPoolUtilization.WithLabelValues("open").Set(5)
-	metrics.RPCLatencySeconds.WithLabelValues("stellar", "GetAccount").Observe(0.12)
+	metrics.RPCLatencySeconds.WithLabelValues("arc", "GetAccount").Observe(0.12)
 
 	r := gin.New()
 	r.Use(middleware.PrometheusMiddleware())
@@ -51,12 +51,12 @@ func TestPrometheusMiddleware_RecordsMetrics(t *testing.T) {
 	assert.Equal(t, http.StatusOK, wm.Code)
 	body := wm.Body.String()
 
-	assert.Contains(t, body, "moistello_http_requests_total")
-	assert.Contains(t, body, "moistello_http_duration_seconds")
-	assert.Contains(t, body, "moistello_http_errors_total")
-	assert.Contains(t, body, "moistello_websocket_active_connections")
-	assert.Contains(t, body, "moistello_db_pool_utilization")
-	assert.Contains(t, body, "moistello_rpc_latency_seconds")
+	assert.Contains(t, body, "deodes_http_requests_total")
+	assert.Contains(t, body, "deodes_http_duration_seconds")
+	assert.Contains(t, body, "deodes_http_errors_total")
+	assert.Contains(t, body, "deodes_websocket_active_connections")
+	assert.Contains(t, body, "deodes_db_pool_utilization")
+	assert.Contains(t, body, "deodes_rpc_latency_seconds")
 }
 
 func TestMetricsEndpoint_RequiresAdminAPIKey(t *testing.T) {
@@ -87,7 +87,7 @@ func TestMetricsEndpoint_RequiresAdminAPIKey(t *testing.T) {
 	req3.Header.Set("X-Admin-API-Key", adminKey)
 	r.ServeHTTP(w3, req3)
 	assert.Equal(t, http.StatusOK, w3.Code)
-	assert.Contains(t, w3.Body.String(), "moistello_http_requests_total")
+	assert.Contains(t, w3.Body.String(), "deodes_http_requests_total")
 }
 
 func TestMetricsEndpoint_DualAdminAPIKeys_ZeroDowntimeRotation(t *testing.T) {

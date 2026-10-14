@@ -75,6 +75,10 @@ func (m *Repository) UpdateMemberStatus(ctx context.Context, circleID, userID uu
 	return m.Called(ctx, circleID, userID, status).Error(0)
 }
 
+func (m *Repository) UpdateMemberStrikes(ctx context.Context, circleID, userID uuid.UUID, strikes int) error {
+	return m.Called(ctx, circleID, userID, strikes).Error(0)
+}
+
 func (m *Repository) FindMemberByCircleAndUser(ctx context.Context, circleID, userID uuid.UUID) (*circle.CircleMember, error) {
 	args := m.Called(ctx, circleID, userID)
 	if args.Get(0) == nil {

@@ -59,13 +59,13 @@ func TestQueuedDispatcher_PublishesEnvelopePerRegistration(t *testing.T) {
 	}}
 
 	pub := &recordingPublisher{}
-	d := NewQueuedDispatcher(repo, pub, "moistello.events")
+	d := NewQueuedDispatcher(repo, pub, "deodes.events")
 
 	payload := map[string]string{"event": "contribution.recorded"}
 	require.NoError(t, d.DispatchPayload(context.Background(), payload, "req-42", 5))
 
 	assert.Len(t, pub.bodies, 2)
-	assert.Equal(t, "moistello.events", pub.exchange)
+	assert.Equal(t, "deodes.events", pub.exchange)
 	assert.Equal(t, WebhookRoutingKey, pub.routingKey)
 
 	var urls []string
@@ -83,7 +83,7 @@ func TestQueuedDispatcher_PublishesEnvelopePerRegistration(t *testing.T) {
 func TestQueuedDispatcher_NoRegistrations(t *testing.T) {
 	repo := &listRepo{}
 	pub := &recordingPublisher{}
-	d := NewQueuedDispatcher(repo, pub, "moistello.events")
+	d := NewQueuedDispatcher(repo, pub, "deodes.events")
 
 	require.NoError(t, d.DispatchPayload(context.Background(), map[string]string{}, "", 3))
 	assert.Empty(t, pub.bodies)

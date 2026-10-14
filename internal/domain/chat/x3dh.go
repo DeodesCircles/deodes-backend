@@ -123,7 +123,7 @@ func InitiateHandshake(aliceIK, aliceEK *X3DHKeyPair, bobBundle *PreKeyBundle) (
 	}
 
 	// Derive master key via HKDF
-	masterKey, err := deriveHKDF(dhSecret, []byte("Moistello-X3DH-Protocol-Info"), 32)
+	masterKey, err := deriveHKDF(dhSecret, []byte("Deodes-X3DH-Protocol-Info"), 32)
 	if err != nil {
 		return nil, fmt.Errorf("HKDF derivation failed: %w", err)
 	}
@@ -190,7 +190,7 @@ func RespondToHandshake(bobIK, bobSPK *X3DHKeyPair, bobOPK *X3DHKeyPair, aliceIK
 		dhSecret = append(dhSecret, dh4...)
 	}
 
-	masterKey, err := deriveHKDF(dhSecret, []byte("Moistello-X3DH-Protocol-Info"), 32)
+	masterKey, err := deriveHKDF(dhSecret, []byte("Deodes-X3DH-Protocol-Info"), 32)
 	if err != nil {
 		return nil, fmt.Errorf("HKDF derivation failed: %w", err)
 	}

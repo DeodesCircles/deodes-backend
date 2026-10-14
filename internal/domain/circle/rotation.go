@@ -18,7 +18,7 @@ var ErrRotationComplete = errors.New("rotation complete: every member has alread
 // from the circle ID and round number (SHA-256, first 8 bytes, big-endian).
 // Anyone with the circle ID and round can recompute the draw order, which is
 // the provability property the off-chain draw offers in place of an on-chain
-// VRF: the product spec names a Soroban VRF contract for random payout order,
+// VRF: the product spec names a VRF contract for random payout order,
 // but no such contract is wired into this backend today — recipient selection
 // below is a seeded pseudo-random shuffle (math/rand, see RandomOrder), and
 // the rotation invariant (no repeats until every member is paid) is enforced

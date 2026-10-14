@@ -11,7 +11,7 @@ import (
 	"github.com/deodes/backend/internal/domain/chat"
 )
 
-const redisChannel = "moistello:ws:events"
+const redisChannel = "deodes:ws:events"
 
 // Broadcaster relays real-time events to WebSocket clients and to other
 // API server instances via Redis Pub/Sub.
@@ -133,6 +133,19 @@ func (b *Broadcaster) NotificationCreated(ctx context.Context, userID, notificat
 }
 
 // ── Chat events ──
+
+// BroadcastChainEvent relays one decoded on-chain event to a circle room
+// (2.6 indexer). The payload carries raw decoded fields (addresses as 0x,
+// uints as decimal strings); rooms are circle-scoped so delivery follows
+// existing subscriptions, and the Redis bridge fans out cross-instance.
+func (b *Broadcaster) BroadcastChainEvent(_ context.Context, circleID, eventType string, payload map[string]any) {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["circleId"] = circleID
+	payload["timestamp"] = time.Now().UTC()
+	b.publish(circleID, Message{Type: eventType, Payload: payload})
+}
 
 // ChatMessageDelivered pushes a newly-sent E2EE chat message to the
 // recipient's live WebSocket connection(s), if any are open. Satisfies

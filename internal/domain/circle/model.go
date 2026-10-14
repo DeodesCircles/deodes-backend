@@ -96,7 +96,10 @@ type CircleMember struct {
 	UserID   uuid.UUID    `json:"userId" db:"user_id"`
 	Position int          `json:"position" db:"position"`
 	Status   MemberStatus `json:"status" db:"status"`
-	JoinedAt time.Time    `json:"joinedAt" db:"joined_at"`
+	// Strikes accumulates late/missed-contribution penalties (2.7); at
+	// MaxStrikes the member is removed. Persisted in circle_members.strikes.
+	Strikes  int       `json:"strikes" db:"strikes"`
+	JoinedAt time.Time `json:"joinedAt" db:"joined_at"`
 }
 
 type PenaltyType string

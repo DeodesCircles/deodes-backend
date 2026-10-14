@@ -10,17 +10,10 @@ import (
 	"github.com/deodes/backend/pkg/apperrors"
 	"github.com/deodes/backend/pkg/arc"
 	"github.com/deodes/backend/pkg/response"
-	"github.com/deodes/backend/pkg/stellar"
 )
 
 func isWalletAddress(addr string) bool {
-	if err := stellar.ValidateAddress(addr); err == nil {
-		return true
-	}
-	if err := arc.ValidateAddress(addr); err == nil {
-		return true
-	}
-	return false
+	return arc.ValidateAddress(addr) == nil
 }
 
 // WalletAuthHandler handles wallet-based authentication: obtaining a signed
@@ -54,7 +47,7 @@ func (h *WalletAuthHandler) Nonce(c *gin.Context) {
 	}
 
 	if !isWalletAddress(req.WalletAddress) {
-		response.BadRequest(c, "invalid wallet address: must be Arc 0x or Stellar G...")
+		response.BadRequest(c, "invalid wallet address: must be Arc 0x")
 		return
 	}
 
@@ -87,7 +80,7 @@ func (h *WalletAuthHandler) Verify(c *gin.Context) {
 	}
 
 	if !isWalletAddress(req.WalletAddress) {
-		response.BadRequest(c, "invalid wallet address: must be Arc 0x or Stellar G...")
+		response.BadRequest(c, "invalid wallet address: must be Arc 0x")
 		return
 	}
 

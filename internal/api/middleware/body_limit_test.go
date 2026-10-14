@@ -53,7 +53,7 @@ func assertTooLarge(t *testing.T, w *httptest.ResponseRecorder, limit int64) {
 	assert.Contains(t, body, `"limitBytes":`+strconv.FormatInt(limit, 10),
 		"413 should report the cap that was violated")
 	// RFC 9457 problem details, consistent with every other error envelope.
-	assert.Contains(t, body, `"type":"https://moistello.com/probs/request-body-too-large"`)
+	assert.Contains(t, body, `"type":"https://deodes.com/probs/request-body-too-large"`)
 	assert.Contains(t, body, `"title":"Request Entity Too Large"`)
 }
 

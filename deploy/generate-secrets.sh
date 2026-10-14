@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Generate production secrets for Moistello backend
+# Generate production secrets for Deodes backend
 # Usage: ./generate-secrets.sh [jwt|quarterly|all]
 # - jwt: Generate JWT keypair (one-time only)
 # - quarterly: Generate quarterly-rotation secrets (peppers, API keys)

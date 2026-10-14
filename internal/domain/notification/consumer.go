@@ -9,7 +9,7 @@ import (
 )
 
 // NotificationsQueue is the durable queue notification events are consumed
-// from. Config default: "moistello.notifications".
+// from. Config default: "deodes.notifications".
 const notificationsRoutingPattern = "notification.*"
 
 // StartQueueConsumer ensures the durable notifications queue exists, binds it

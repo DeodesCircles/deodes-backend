@@ -1,146 +1,170 @@
+// Package indexer tails DeodesCircle/DeodesFactory logs on Arc (2.6).
 package indexer
 
-import "time"
+import (
+	"encoding/hex"
+	"fmt"
+	"strings"
 
-// Contract event type constants — must match the Symbol topics emitted by the
-// Soroban contracts (CircleFactory, Circle, ReputationRegistry, Treasury).
-const (
-	EventCircleCreated        = "CircleCreated"
-	EventMemberJoined         = "MemberJoined"
-	EventContributionReceived = "ContributionReceived"
-	EventPayoutExecuted       = "PayoutExecuted"
-	EventLateReported         = "LateReported"
-	EventMemberExited         = "MemberExited"
-	EventDefaultRecorded      = "DefaultRecorded"
-	EventCircleCompleted      = "CircleCompleted"
-	EventAuctionBid           = "AuctionBid"
-	EventVoteCast             = "VoteCast"
-	EventDisputeRaised        = "DisputeRaised"
-	EventFeeDeposited         = "FeeDeposited"
+	"github.com/deodes/backend/pkg/arc"
 )
 
-// ContractEvent is a fully-decoded Soroban contract event extracted from a
-// Stellar transaction's result_meta_xdr. All 12 event types share this struct;
-// the typed payload structs below are used only within handler implementations.
-type ContractEvent struct {
-	// ContractID is the Soroban contract address that emitted the event.
-	ContractID string `json:"contract_id"`
-	// EventType corresponds to one of the EventXxx constants above.
-	EventType string `json:"event_type"`
-	// Ledger is the Stellar ledger sequence number containing this event.
-	Ledger int64 `json:"ledger"`
-	// TxHash is the transaction hash that produced this event.
-	TxHash string `json:"tx_hash"`
-	// LedgerCloseTime is the close time of the ledger containing this event,
-	// set by the processor from the transaction's ledger close time.
-	// Used instead of time.Now() to ensure timestamps follow ledger
-	// sequence ordering (#471).
-	LedgerCloseTime time.Time `json:"-"`
-	// ContractVersion is the executable (WASM) hash of the contract that emitted
-	// the event, recorded so an event stays attributable to the exact code that
-	// produced it across contract upgrades, which leave the contract ID
-	// unchanged. It is ContractVersionUnknown when the deployed version could
-	// not be resolved.
-	//
-	// Decoding leaves this empty: the version is not carried in the event XDR
-	// and is filled in by the processor when the event is recorded, so it is
-	// omitted from a decoded event's JSON rather than rendered as a misleading
-	// empty version.
-	ContractVersion string `json:"contract_version,omitempty"`
-	// Payload is a flat map of decoded XDR field names → Go-native values.
-	// Keys and value types match the typed payload structs below.
-	Payload map[string]any `json:"payload"`
+// ParamKind is one of the ABI types used by IDeodesEvents.
+type ParamKind string
+
+const (
+	KindAddress ParamKind = "address"
+	KindUint256 ParamKind = "uint256"
+	KindBool    ParamKind = "bool"
+)
+
+// Param is one event parameter in declaration order.
+type Param struct {
+	Name    string
+	Kind    ParamKind
+	Indexed bool
 }
 
-// ---------------------------------------------------------------------------
-// Typed payload structs — one per event type.
-// These are used inside handler functions to safely extract Payload fields.
-// ---------------------------------------------------------------------------
-
-// CircleCreatedPayload corresponds to CircleCreated(circle_id, creator, config_hash).
-type CircleCreatedPayload struct {
-	CircleID   string `json:"circle_id"`
-	Creator    string `json:"creator"`
-	ConfigHash string `json:"config_hash"`
+// Schema is the frozen IDeodesEvents signature (UNIFIED-PLAN 1.9).
+// Topic0 is computed at init from Signature so a schema typo fails fast.
+type Schema struct {
+	Name      string
+	Signature string
+	Topic0    string
+	Params    []Param
 }
 
-// MemberJoinedPayload corresponds to MemberJoined(circle_id, member, contribution_amount).
-type MemberJoinedPayload struct {
-	CircleID           string  `json:"circle_id"`
-	Member             string  `json:"member"`
-	ContributionAmount float64 `json:"contribution_amount"`
+func mustSchema(name, sig string, params []Param) Schema {
+	topic := "0x" + hex.EncodeToString(arc.Keccak256([]byte(sig)))
+	return Schema{Name: name, Signature: sig, Topic0: topic, Params: params}
 }
 
-// ContributionReceivedPayload corresponds to ContributionReceived(circle_id, member, amount, round).
-type ContributionReceivedPayload struct {
-	CircleID string  `json:"circle_id"`
-	Member   string  `json:"member"`
-	Amount   float64 `json:"amount"`
-	Round    int     `json:"round"`
+func addr(name string, indexed bool) Param {
+	return Param{Name: name, Kind: KindAddress, Indexed: indexed}
+}
+func u256(name string, indexed bool) Param {
+	return Param{Name: name, Kind: KindUint256, Indexed: indexed}
+}
+func boolean(name string, indexed bool) Param {
+	return Param{Name: name, Kind: KindBool, Indexed: indexed}
 }
 
-// PayoutExecutedPayload corresponds to PayoutExecuted(circle_id, recipient, amount, round, payout_type).
-type PayoutExecutedPayload struct {
-	CircleID   string  `json:"circle_id"`
-	Recipient  string  `json:"recipient"`
-	Amount     float64 `json:"amount"`
-	Round      int     `json:"round"`
-	PayoutType string  `json:"payout_type"`
+// Schemas mirrors IDeodesEvents.sol exactly: circle indexed first everywhere.
+var Schemas = []Schema{
+	mustSchema("CircleCreated", "CircleCreated(address,address,address,uint256,uint256,uint256)",
+		[]Param{addr("circle", true), addr("organizer", true), addr("treasury", false), u256("contribution", false), u256("maxMembers", false), u256("index", false)}),
+	mustSchema("MemberJoined", "MemberJoined(address,address)",
+		[]Param{addr("circle", true), addr("member", true)}),
+	mustSchema("ContributionReceived", "ContributionReceived(address,address,uint256)",
+		[]Param{addr("circle", true), addr("member", true), u256("amount", false)}),
+	mustSchema("PayoutExecuted", "PayoutExecuted(address,address,uint256,uint256)",
+		[]Param{addr("circle", true), addr("recipient", true), u256("net", false), u256("fee", false)}),
+	mustSchema("FeeDeposited", "FeeDeposited(address,address,uint256)",
+		[]Param{addr("circle", true), addr("treasury", true), u256("fee", false)}),
+	mustSchema("LateReported", "LateReported(address,address,uint256)",
+		[]Param{addr("circle", true), addr("member", true), u256("round", false)}),
+	mustSchema("MemberExited", "MemberExited(address,address)",
+		[]Param{addr("circle", true), addr("member", true)}),
+	mustSchema("DefaultRecorded", "DefaultRecorded(address,address)",
+		[]Param{addr("circle", true), addr("member", true)}),
+	mustSchema("CircleCompleted", "CircleCompleted(address,uint256)",
+		[]Param{addr("circle", true), u256("paidCount", false)}),
+	mustSchema("AuctionBid", "AuctionBid(address,address,uint256,uint256)",
+		[]Param{addr("circle", true), addr("bidder", true), u256("amount", false), u256("round", false)}),
+	mustSchema("VoteCast", "VoteCast(address,address,bool)",
+		[]Param{addr("circle", true), addr("voter", true), boolean("support", false)}),
+	mustSchema("DisputeRaised", "DisputeRaised(address,address,uint256)",
+		[]Param{addr("circle", true), addr("raiser", true), u256("round", false)}),
 }
 
-// LateReportedPayload corresponds to LateReported(circle_id, member, penalty_amount, strikes).
-type LateReportedPayload struct {
-	CircleID      string  `json:"circle_id"`
-	Member        string  `json:"member"`
-	PenaltyAmount float64 `json:"penalty_amount"`
-	Strikes       int     `json:"strikes"`
+// ByTopic0 indexes schemas by their topic0 hash.
+var ByTopic0 = func() map[string]Schema {
+	m := make(map[string]Schema, len(Schemas))
+	for _, s := range Schemas {
+		m[strings.ToLower(s.Topic0)] = s
+	}
+	return m
+}()
+
+// DecodedEvent is a log matched to its schema with stringified fields:
+// addresses as 0x hex, uints as decimal, bools as "true"/"false".
+type DecodedEvent struct {
+	Schema Schema
+	Fields map[string]string
 }
 
-// MemberExitedPayload corresponds to MemberExited(circle_id, member, penalty).
-type MemberExitedPayload struct {
-	CircleID string  `json:"circle_id"`
-	Member   string  `json:"member"`
-	Penalty  float64 `json:"penalty"`
+func decodeValue(kind ParamKind, topic string, word []byte) (string, error) {
+	switch kind {
+	case KindAddress:
+		if topic != "" {
+			return arc.TopicToAddress(topic)
+		}
+		return arc.WordToAddress(word), nil
+	case KindUint256:
+		if topic != "" {
+			v, err := arc.TopicToUint(topic)
+			if err != nil {
+				return "", err
+			}
+			return v.String(), nil
+		}
+		return arc.WordToUint(word).String(), nil
+	case KindBool:
+		if topic != "" {
+			v, err := arc.TopicToUint(topic)
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("%t", v.Sign() != 0), nil
+		}
+		return fmt.Sprintf("%t", arc.WordToBool(word)), nil
+	default:
+		return "", fmt.Errorf("unknown param kind %q", kind)
+	}
 }
 
-// DefaultRecordedPayload corresponds to DefaultRecorded(circle_id, member).
-type DefaultRecordedPayload struct {
-	CircleID string `json:"circle_id"`
-	Member   string `json:"member"`
-}
-
-// CircleCompletedPayload corresponds to CircleCompleted(circle_id, total_contributions).
-type CircleCompletedPayload struct {
-	CircleID           string  `json:"circle_id"`
-	TotalContributions float64 `json:"total_contributions"`
-}
-
-// AuctionBidPayload corresponds to AuctionBid(circle_id, bidder, discount_bips, round).
-type AuctionBidPayload struct {
-	CircleID     string `json:"circle_id"`
-	Bidder       string `json:"bidder"`
-	DiscountBips int    `json:"discount_bips"`
-	Round        int    `json:"round"`
-}
-
-// VoteCastPayload corresponds to VoteCast(circle_id, voter, vote_for, round).
-type VoteCastPayload struct {
-	CircleID string `json:"circle_id"`
-	Voter    string `json:"voter"`
-	VoteFor  string `json:"vote_for"`
-	Round    int    `json:"round"`
-}
-
-// DisputeRaisedPayload corresponds to DisputeRaised(circle_id, member, evidence_hash).
-type DisputeRaisedPayload struct {
-	CircleID     string `json:"circle_id"`
-	Member       string `json:"member"`
-	EvidenceHash string `json:"evidence_hash"`
-}
-
-// FeeDepositedPayload corresponds to the Treasury contract's FeeDeposited event.
-type FeeDepositedPayload struct {
-	CircleID string  `json:"circle_id"`
-	Amount   float64 `json:"amount"`
-	TxHash   string  `json:"tx_hash"`
+// DecodeLog matches topics[0] to a schema and decodes the log. Anonymous
+// logs (no topics) and unknown topic0 values return ok=false, nil.
+func DecodeLog(topics []string, data string) (ev DecodedEvent, ok bool, err error) {
+	if len(topics) == 0 {
+		return DecodedEvent{}, false, nil
+	}
+	schema, known := ByTopic0[strings.ToLower(topics[0])]
+	if !known {
+		return DecodedEvent{}, false, nil
+	}
+	var indexed, plain []Param
+	for _, p := range schema.Params {
+		if p.Indexed {
+			indexed = append(indexed, p)
+		} else {
+			plain = append(plain, p)
+		}
+	}
+	if len(topics)-1 != len(indexed) {
+		return DecodedEvent{}, true, fmt.Errorf("%s: want %d indexed topics, got %d", schema.Name, len(indexed), len(topics)-1)
+	}
+	words, err := arc.DataWords(data)
+	if err != nil {
+		return DecodedEvent{}, true, fmt.Errorf("%s: %w", schema.Name, err)
+	}
+	if len(words) != len(plain) {
+		return DecodedEvent{}, true, fmt.Errorf("%s: want %d data words, got %d", schema.Name, len(plain), len(words))
+	}
+	fields := make(map[string]string, len(schema.Params))
+	for i, p := range indexed {
+		v, err := decodeValue(p.Kind, topics[i+1], nil)
+		if err != nil {
+			return DecodedEvent{}, true, fmt.Errorf("%s.%s: %w", schema.Name, p.Name, err)
+		}
+		fields[p.Name] = v
+	}
+	for i, p := range plain {
+		v, err := decodeValue(p.Kind, "", words[i])
+		if err != nil {
+			return DecodedEvent{}, true, fmt.Errorf("%s.%s: %w", schema.Name, p.Name, err)
+		}
+		fields[p.Name] = v
+	}
+	return DecodedEvent{Schema: schema, Fields: fields}, true, nil
 }

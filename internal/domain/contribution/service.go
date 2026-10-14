@@ -7,30 +7,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
 	"github.com/deodes/backend/internal/domain/circle"
 	"github.com/deodes/backend/pkg/apperrors"
+	"github.com/deodes/backend/pkg/arc"
 	"github.com/deodes/backend/pkg/metrics"
 	"github.com/deodes/backend/pkg/money"
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 	"github.com/rs/zerolog/log"
 )
-
-// isArcTxHash reports whether s looks like an EVM (Arc) transaction hash:
-// 0x followed by 64 hex characters. Stellar Horizon cannot verify these, so
-// the service records them as pending for the Arc indexer instead of hitting
-// Horizon and burning a lookup on every contribution.
-func isArcTxHash(s string) bool {
-	if len(s) != 66 || !strings.HasPrefix(s, "0x") && !strings.HasPrefix(s, "0X") {
-		return false
-	}
-	for _, r := range s[2:] {
-		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F') {
-			return false
-		}
-	}
-	return true
-}
 
 // RecordInput carries all fields needed to record a contribution.
 type RecordInput struct {
@@ -40,8 +25,8 @@ type RecordInput struct {
 	Amount          float64
 	TxnHash         string
 	PayoutScheduled bool
-	// Optional overrides — used by the indexer / tests to set verification
-	// state directly without going through the Horizon check.
+	// Optional overrides — used by tests to set verification
+	// state directly without on-chain verification.
 	VerifiedOnchain    *bool
 	VerificationStatus *VerificationStatus
 }
@@ -49,13 +34,6 @@ type RecordInput struct {
 // PayoutScheduleChecker checks if payout scheduling has begun for a given circle round.
 type PayoutScheduleChecker interface {
 	IsPayoutScheduled(ctx context.Context, circleID string, roundNumber int) (bool, error)
-}
-
-// HorizonVerifier is satisfied by *stellar.Client.
-type HorizonVerifier interface {
-	// VerifyTransaction checks that txnHash exists, was successful, and has a
-	// payment operation sent FROM expectedFrom for expectedAmount.
-	VerifyTransaction(ctx context.Context, txnHash, expectedFrom, expectedAmount string) (bool, error)
 }
 
 // Broadcaster notifies WebSocket clients when a contribution is confirmed.
@@ -83,16 +61,21 @@ type Service interface {
 type ServiceWithCircle interface {
 	Service
 	SetCircleService(circleService circle.Service)
+	// SetArcCircleAddress pins the configured DeodesCircle contract (2.5).
+	// Empty clears it (chain checks dormant). A malformed address is
+	// rejected here so a typo fails wiring, not a live contribution.
+	SetArcCircleAddress(addr string) error
 }
 
 type service struct {
-	repo            Repository
-	broadcaster     Broadcaster
-	tx              Transactor
-	horizon         HorizonVerifier
-	payoutChecker   PayoutScheduleChecker
-	masterPublicKey string
-	circleService   circle.Service
+	repo          Repository
+	broadcaster   Broadcaster
+	tx            Transactor
+	payoutChecker PayoutScheduleChecker
+	circleService circle.Service
+	// arcCircleAddress is cfg.Arc.CircleAddress: the canonical circle
+	// contract Record resolves against. Empty means unwired (dev).
+	arcCircleAddress string
 }
 
 // SetPayoutChecker sets the payout schedule checker on the contribution service.
@@ -100,27 +83,60 @@ func (s *service) SetPayoutChecker(checker PayoutScheduleChecker) {
 	s.payoutChecker = checker
 }
 
-// NewService constructs the contribution service.
+// NewService constructs the contribution service. On-chain verification is
+// the Arc indexer's job (Phase 2.6): non-Arc hashes record as pending for
+// async verification; explicit caller states always win.
 //
 //	broadcaster  – may be nil (no WS events)
 //	tx           – may be nil (no DB transaction wrapping)
-//	horizon      – may be nil (on-chain verification skipped; useful in tests)
-//	masterPK     – Stellar master public key; if empty the sender check is skipped
 //	circleSvc    – circle service for membership/round validity checks
-func NewService(repo Repository, broadcaster Broadcaster, tx Transactor, horizon HorizonVerifier, masterPublicKey string, circleSvc circle.Service) Service {
+func NewService(repo Repository, broadcaster Broadcaster, tx Transactor, circleSvc circle.Service) Service {
 	return &service{
-		repo:            repo,
-		broadcaster:     broadcaster,
-		tx:              tx,
-		horizon:         horizon,
-		masterPublicKey: masterPublicKey,
-		circleService:   circleSvc,
+		repo:          repo,
+		broadcaster:   broadcaster,
+		tx:            tx,
+		circleService: circleSvc,
 	}
 }
 
 // SetCircleService sets the circle service for membership/round validity checks.
 func (s *service) SetCircleService(cs circle.Service) {
 	s.circleService = cs
+}
+
+// SetArcCircleAddress pins the configured circle contract (2.5 wiring).
+func (s *service) SetArcCircleAddress(addr string) error {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		s.arcCircleAddress = ""
+		return nil
+	}
+	if err := arc.ValidateAddress(addr); err != nil {
+		return fmt.Errorf("contribution: invalid arc circle address: %w", err)
+	}
+	s.arcCircleAddress = addr
+	return nil
+}
+
+// resolveCircleContract returns the on-chain contract a contribution for cir
+// must have touched: the circle's own contract_id when set, else the
+// configured circle. A circle bound to a DIFFERENT contract than configured
+// is rejected (wrong circle/rail) rather than recorded against the wrong
+// address.
+func (s *service) resolveCircleContract(cir *circle.Circle) (string, error) {
+	configured := s.arcCircleAddress
+	own := ""
+	if cir != nil && cir.ContractID.Valid {
+		own = strings.TrimSpace(cir.ContractID.String)
+	}
+	if own != "" && configured != "" && !strings.EqualFold(own, configured) {
+		return "", fmt.Errorf("%w: circle %s is bound to %s, configured circle is %s",
+			apperrors.ErrCircleContractMismatch, cir.ID, own, configured)
+	}
+	if own != "" {
+		return own, nil
+	}
+	return configured, nil
 }
 
 // NewTransactor creates a DB-backed Transactor for the contribution domain.
@@ -194,6 +210,11 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Contribution,
 		if cir.Status == circle.CircleStatusCompleted || cir.Status == circle.CircleStatusCancelled {
 			return nil, apperrors.ErrCircleEnded
 		}
+		// Phase 2.5: the contribution must resolve against the configured
+		// circle contract — a circle bound elsewhere is the wrong rail.
+		if _, err := s.resolveCircleContract(cir); err != nil {
+			return nil, err
+		}
 	}
 
 	// Idempotency: if this txnHash was already recorded, return existing row.
@@ -216,42 +237,14 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Contribution,
 		verificationStatus = *input.VerificationStatus
 	}
 
-	// Arc EVM hashes (0x…) cannot be verified by Stellar Horizon. Record
-	// them as pending for the Arc indexer instead of wasting a Horizon
-	// lookup that can only fail.
-	isArcHash := isArcTxHash(input.TxnHash)
-	if isArcHash && input.VerifiedOnchain == nil && input.VerificationStatus == nil {
+	// Hashes record as pending for the Arc indexer (2.6), which settles
+	// on-chain verification. Explicit caller states always win (above).
+	if input.TxnHash != "" && input.VerifiedOnchain == nil && input.VerificationStatus == nil {
 		verificationStatus = VerificationStatusPending
 	}
 
-	// On-chain verification: only run when horizon client is available, the
-	// caller has NOT already supplied an explicit verification state, and the
-	// hash is NOT an Arc EVM hash (handled above).
-	if s.horizon != nil && input.TxnHash != "" && !isArcHash &&
-		input.VerifiedOnchain == nil && input.VerificationStatus == nil {
-
-		amount, amtErr := money.FromFloat64(input.Amount)
-		if amtErr != nil {
-			return nil, fmt.Errorf("invalid contribution amount: %w", amtErr)
-		}
-		ok, verErr := s.horizon.VerifyTransaction(ctx, input.TxnHash, s.masterPublicKey, amount.String())
-		if verErr != nil {
-			// Horizon is unavailable — record as pending for async retry.
-			log.Warn().Err(verErr).Str("txn_hash", input.TxnHash).
-				Msg("horizon verification failed; recording contribution as pending")
-			verificationStatus = VerificationStatusPending
-		} else if !ok {
-			// Transaction does not match — reject immediately.
-			metrics.ContributionsTotal.WithLabelValues("rejected", "", "").Inc()
-			return nil, fmt.Errorf("on-chain verification failed: txnHash %s does not match expected sender/amount", input.TxnHash)
-		} else {
-			verifiedOnchain = true
-			verificationStatus = VerificationStatusVerified
-		}
-	}
-
 	// Validate membership and round validity. A nil circle service (unit
-	// tests, indexer replay) skips the membership check and only requires a
+	// tests) skips the membership check and only requires a
 	// positive round number.
 	isOnTime := input.RoundNumber >= 1
 	if s.circleService != nil {

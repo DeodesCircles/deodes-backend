@@ -20,7 +20,7 @@ func NewWalletHandler(svc wallet.Service, authSvc auth.Service) *WalletHandler {
 	return &WalletHandler{walletSvc: svc, authSvc: authSvc}
 }
 
-// CreateWallet creates a new Stellar wallet for the authenticated user, or returns existing
+// CreateWallet creates a new Ed25519 wallet for the authenticated user, or returns existing
 // POST /v1/wallets
 func (h *WalletHandler) CreateWallet(c *gin.Context) {
 	userID := middleware.GetUserID(c)

@@ -48,9 +48,9 @@ Eviction counters:
 
 | Metric | Meaning |
 | --- | --- |
-| `moistello_websocket_dropped_messages_total` | Messages discarded because a send buffer was full |
-| `moistello_websocket_slow_clients_disconnected_total` | Connections evicted for backpressure |
-| `moistello_websocket_stale_connections_closed_total` | Connections closed after missed heartbeats |
+| `deodes_websocket_dropped_messages_total` | Messages discarded because a send buffer was full |
+| `deodes_websocket_slow_clients_disconnected_total` | Connections evicted for backpressure |
+| `deodes_websocket_stale_connections_closed_total` | Connections closed after missed heartbeats |
 
 A client that reconnects faster than it can consume will be evicted again, so
 the fix is to read from the socket promptly (or to resume from REST) rather
@@ -92,7 +92,7 @@ Covered by `TestHub_ReconnectRequiresResubscribe` and
 
 ## Multiple API instances
 
-Events are also published to Redis (`moistello:ws:events`) so every instance
+Events are also published to Redis (`deodes:ws:events`) so every instance
 delivers to its own local clients. This path is at-most-once: if the bridge
 queue is full the incoming Pub/Sub message is dropped, and Redis Pub/Sub
 ordering guarantees apply only within a single channel. The per-connection

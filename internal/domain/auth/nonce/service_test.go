@@ -2,21 +2,47 @@ package nonce
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	"github.com/redis/go-redis/v9"
-	"github.com/stellar/go/strkey"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/sha3"
 
 	"github.com/deodes/backend/pkg/apperrors"
+	"github.com/deodes/backend/pkg/arc"
 )
+
+// testWallet mints a fresh secp256k1 key and its 0x address (EIP-55-agnostic
+// lowercase form, which SameSigner compares case-insensitively).
+func testWallet(t *testing.T) (*secp256k1.PrivateKey, string) {
+	t.Helper()
+	priv, err := secp256k1.GeneratePrivateKey()
+	require.NoError(t, err)
+	uncompressed := priv.PubKey().SerializeUncompressed()
+	h := sha3.NewLegacyKeccak256()
+	h.Write(uncompressed[1:])
+	sum := h.Sum(nil)
+	return priv, "0x" + hex.EncodeToString(sum[12:])
+}
+
+// signPersonal produces a 65-byte EIP-191 personal_sign signature (R||S||V
+// with V 27/28) for the raw nonce string.
+func signPersonal(t *testing.T, priv *secp256k1.PrivateKey, nonce string) string {
+	t.Helper()
+	sig := ecdsa.SignCompact(priv, arc.PersonalSignHash(nonce), false)
+	require.Len(t, sig, 65)
+	require.Contains(t, []int{27, 28}, int(sig[0]))
+	out := make([]byte, 65)
+	copy(out, sig[1:])
+	out[64] = sig[0]
+	return hex.EncodeToString(out)
+}
 
 func TestNonceReplayAttackMatrix(t *testing.T) {
 	redisClient, mr := setupRedis(t)
@@ -25,23 +51,14 @@ func TestNonceReplayAttackMatrix(t *testing.T) {
 	svc := NewService(redisClient, 5*time.Minute)
 	ctx := context.Background()
 
-	// Generate a test Stellar keypair
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	require.NoError(t, err)
-
-	// Encode to Stellar address format
-	walletAddress, err := strkey.Encode(strkey.VersionByteAccountID, publicKey[:])
-	require.NoError(t, err)
+	priv, walletAddress := testWallet(t)
 
 	t.Run("single-use enforcement: nonce deleted after successful verification", func(t *testing.T) {
 		// Generate nonce
 		nonce, err := svc.Generate(ctx, walletAddress)
 		require.NoError(t, err)
 
-		// Sign the nonce
-		message := sha256.Sum256([]byte(nonce.Nonce))
-		signature := ed25519.Sign(privateKey, message[:])
-		sigHex := hex.EncodeToString(signature)
+		sigHex := signPersonal(t, priv, nonce.Nonce)
 
 		// First verification should succeed
 		valid, err := svc.Verify(ctx, walletAddress, sigHex)
@@ -60,10 +77,7 @@ func TestNonceReplayAttackMatrix(t *testing.T) {
 		nonce, err := svc.Generate(ctx, walletAddress)
 		require.NoError(t, err)
 
-		// Sign the nonce
-		message := sha256.Sum256([]byte(nonce.Nonce))
-		signature := ed25519.Sign(privateKey, message[:])
-		sigHex := hex.EncodeToString(signature)
+		sigHex := signPersonal(t, priv, nonce.Nonce)
 
 		// Verify successfully (deletes nonce)
 		valid, err := svc.Verify(ctx, walletAddress, sigHex)
@@ -83,10 +97,7 @@ func TestNonceReplayAttackMatrix(t *testing.T) {
 		nonce, err := svc.Generate(ctx, walletAddress)
 		require.NoError(t, err)
 
-		// Sign the nonce
-		message := sha256.Sum256([]byte(nonce.Nonce))
-		signature := ed25519.Sign(privateKey, message[:])
-		sigHex := hex.EncodeToString(signature)
+		sigHex := signPersonal(t, priv, nonce.Nonce)
 
 		// Simulate concurrent double-submit (both calls in quick succession)
 		results := make(chan struct {
@@ -114,7 +125,7 @@ func TestNonceReplayAttackMatrix(t *testing.T) {
 		r1 := <-results
 		r2 := <-results
 
-		// One should succeed, one should fail
+		// Atomic compare-and-del consumption: exactly one request wins.
 		successCount := 0
 		if r1.err == nil && r1.valid {
 			successCount++
@@ -122,10 +133,7 @@ func TestNonceReplayAttackMatrix(t *testing.T) {
 		if r2.err == nil && r2.valid {
 			successCount++
 		}
-
-		// Either exactly one or zero succeed (depending on Redis ordering)
-		// Both failing is also acceptable (if deletion happens before both reads)
-		assert.True(t, successCount <= 1, "At most one concurrent request should succeed")
+		assert.Equal(t, 1, successCount, "atomic single-use: exactly one concurrent request must succeed")
 	})
 
 	t.Run("post-restart reuse of nonce fails", func(t *testing.T) {
@@ -133,10 +141,7 @@ func TestNonceReplayAttackMatrix(t *testing.T) {
 		nonce, err := svc.Generate(ctx, walletAddress)
 		require.NoError(t, err)
 
-		// Sign the nonce
-		message := sha256.Sum256([]byte(nonce.Nonce))
-		signature := ed25519.Sign(privateKey, message[:])
-		sigHex := hex.EncodeToString(signature)
+		sigHex := signPersonal(t, priv, nonce.Nonce)
 
 		// Verify successfully
 		valid, err := svc.Verify(ctx, walletAddress, sigHex)
@@ -159,22 +164,32 @@ func TestNonceReplayAttackMatrix(t *testing.T) {
 		nonce, err := svc.Generate(ctx, walletAddress)
 		require.NoError(t, err)
 
-		// Create invalid signature
-		invalidSig := hex.EncodeToString(make([]byte, 64))
+		// Sign with a DIFFERENT key: well-formed 65-byte signature that
+		// recovers to another address (rejected, nonce survives).
+		otherPriv, _ := secp256k1.GeneratePrivateKey()
+		wrongSigHex := signPersonal(t, otherPriv, nonce.Nonce)
 
-		// Verify with invalid signature should fail
-		valid, err := svc.Verify(ctx, walletAddress, invalidSig)
+		valid, err := svc.Verify(ctx, walletAddress, wrongSigHex)
 		assert.NoError(t, err)
 		assert.False(t, valid)
 
 		// Nonce should still exist - try with valid signature
-		message := sha256.Sum256([]byte(nonce.Nonce))
-		signature := ed25519.Sign(privateKey, message[:])
-		sigHex := hex.EncodeToString(signature)
+		sigHex := signPersonal(t, priv, nonce.Nonce)
 
 		valid, err = svc.Verify(ctx, walletAddress, sigHex)
 		assert.NoError(t, err)
 		assert.True(t, valid)
+	})
+
+	t.Run("malformed signature errors loudly", func(t *testing.T) {
+		_, err := svc.Generate(ctx, walletAddress)
+		require.NoError(t, err)
+
+		// 64 zero bytes: well-formed hex but not a 65-byte signature.
+		invalidSig := hex.EncodeToString(make([]byte, 64))
+		valid, err := svc.Verify(ctx, walletAddress, invalidSig)
+		assert.Error(t, err)
+		assert.False(t, valid)
 	})
 
 	t.Run("nonce expiry prevents reuse", func(t *testing.T) {
@@ -188,10 +203,7 @@ func TestNonceReplayAttackMatrix(t *testing.T) {
 		// Wait for nonce to expire (exceeding 30s clock skew tolerance)
 		mr.FastForward(35 * time.Second)
 
-		// Sign the nonce
-		message := sha256.Sum256([]byte(nonce.Nonce))
-		signature := ed25519.Sign(privateKey, message[:])
-		sigHex := hex.EncodeToString(signature)
+		sigHex := signPersonal(t, priv, nonce.Nonce)
 
 		// Verification should fail due to expiry
 		valid, err := shortTTLSvc.Verify(ctx, walletAddress, sigHex)
@@ -208,12 +220,7 @@ func TestNonceBasicFlow(t *testing.T) {
 	svc := NewService(redisClient, 5*time.Minute)
 	ctx := context.Background()
 
-	// Generate a test Stellar keypair
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	require.NoError(t, err)
-
-	walletAddress, err := strkey.Encode(strkey.VersionByteAccountID, publicKey[:])
-	require.NoError(t, err)
+	priv, walletAddress := testWallet(t)
 
 	t.Run("generate and verify valid nonce", func(t *testing.T) {
 		// Generate nonce
@@ -223,10 +230,7 @@ func TestNonceBasicFlow(t *testing.T) {
 		assert.Equal(t, walletAddress, nonce.WalletAddress)
 		assert.False(t, nonce.ExpiresAt.IsZero())
 
-		// Sign the nonce
-		message := sha256.Sum256([]byte(nonce.Nonce))
-		signature := ed25519.Sign(privateKey, message[:])
-		sigHex := hex.EncodeToString(signature)
+		sigHex := signPersonal(t, priv, nonce.Nonce)
 
 		// Verify signature
 		valid, err := svc.Verify(ctx, walletAddress, sigHex)
@@ -240,10 +244,10 @@ func TestNonceBasicFlow(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, nonce.Nonce)
 
-		// Create wrong signature (sign wrong data)
-		wrongMessage := sha256.Sum256([]byte("wrong"))
-		wrongSig := ed25519.Sign(privateKey, wrongMessage[:])
-		wrongSigHex := hex.EncodeToString(wrongSig)
+		// Sign the nonce with the WRONG key: well-formed 65-byte signature
+		// recovering to a different address.
+		otherPriv, _ := secp256k1.GeneratePrivateKey()
+		wrongSigHex := signPersonal(t, otherPriv, nonce.Nonce)
 
 		// Verify wrong signature
 		valid, err := svc.Verify(ctx, walletAddress, wrongSigHex)
@@ -262,10 +266,7 @@ func TestNonceBasicFlow(t *testing.T) {
 		// Wait for expiry (exceeding 30s clock skew tolerance)
 		mr.FastForward(35 * time.Second)
 
-		// Sign the expired nonce
-		message := sha256.Sum256([]byte(nonce.Nonce))
-		signature := ed25519.Sign(privateKey, message[:])
-		sigHex := hex.EncodeToString(signature)
+		sigHex := signPersonal(t, priv, nonce.Nonce)
 
 		// Verify expired nonce
 		valid, err := shortTTLSvc.Verify(ctx, walletAddress, sigHex)
@@ -276,14 +277,24 @@ func TestNonceBasicFlow(t *testing.T) {
 
 	t.Run("reject nonexistent nonce", func(t *testing.T) {
 		// Try to verify a nonce that was never generated
-		fakeNonce := "0000000000000000000000000000000000000000000000000000000000000000"
-		message := sha256.Sum256([]byte(fakeNonce))
-		signature := ed25519.Sign(privateKey, message[:])
-		sigHex := hex.EncodeToString(signature)
+		otherPriv, _ := secp256k1.GeneratePrivateKey()
+		sigHex := signPersonal(t, otherPriv, "0000000000000000000000000000000000000000000000000000000000000000")
 
 		valid, err := svc.Verify(ctx, walletAddress, sigHex)
 		assert.Error(t, err)
 		assert.Equal(t, apperrors.ErrNonceExpired, err)
+		assert.False(t, valid)
+	})
+
+	t.Run("reject signature from another key", func(t *testing.T) {
+		nonce, err := svc.Generate(ctx, walletAddress)
+		require.NoError(t, err)
+
+		otherPriv, _ := secp256k1.GeneratePrivateKey()
+		sigHex := signPersonal(t, otherPriv, nonce.Nonce)
+
+		valid, err := svc.Verify(ctx, walletAddress, sigHex)
+		assert.NoError(t, err)
 		assert.False(t, valid)
 	})
 }

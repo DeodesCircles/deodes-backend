@@ -28,6 +28,8 @@ type AuthHandler struct {
 	*RegistrationHandler
 	*TOTPEnrollmentHandler
 	*EmailChangeHandler
+	*GoogleAuthHandler
+	*PasswordResetHandler
 }
 
 // NewAuthHandler builds the auth handler aggregate. The signature is kept for
@@ -45,7 +47,15 @@ func NewAuthHandler(authSvc auth.Service, userSvc user.Service, walletSvc wallet
 		RegistrationHandler:   NewRegistrationHandler(authSvc, userRepo, verificationSvc, walletSvc),
 		TOTPEnrollmentHandler: NewTOTPEnrollmentHandler(userSvc, userRepo, totpSvc),
 		EmailChangeHandler:    NewEmailChangeHandler(userSvc, userRepo, verificationSvc, redisClient),
+		PasswordResetHandler:  NewPasswordResetHandler(authSvc, userSvc, verificationSvc),
 	}
+}
+
+// WithGoogle attaches Google sign-in. clientID empty keeps the endpoint
+// fail-closed (503). Called from main only, so existing callers are untouched.
+func (h *AuthHandler) WithGoogle(authSvc auth.Service, userSvc user.Service, userRepo user.Repository, walletSvc wallet.Service, clientID string) *AuthHandler {
+	h.GoogleAuthHandler = NewGoogleAuthHandler(authSvc, userSvc, userRepo, walletSvc, clientID)
+	return h
 }
 
 // sessionTTLFromUser returns the configured session TTL, falling back to the

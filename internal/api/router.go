@@ -55,7 +55,6 @@ func NewRouter(
 	communityHandler *handler.CommunityHandler,
 	wsHandler *handler.WebSocketHandler,
 	savingsGoalHandler *handler.SavingsGoalHandler,
-	tokenHandler *handler.TokenHandler,
 	swapHandler *handler.SwapHandler,
 	governanceHandler *handler.GovernanceHandler,
 	reputationHandler *handler.ReputationHandler,
@@ -63,7 +62,6 @@ func NewRouter(
 	consentHandler *handler.ConsentHandler,
 	subscriptionHandler *handler.SubscriptionHandler,
 	adminJobQueueHandler *handler.AdminJobQueueHandler,
-	adminIndexerHandler *handler.AdminIndexerHandler,
 	webhookRepo webhook.WebhookRepository,
 	jwtPublicKey []byte,
 ) *gin.Engine {
@@ -132,6 +130,8 @@ func NewRouter(
 			auth.POST("/nonce", authHandler.Nonce)
 			auth.POST("/verify", authHandler.Verify)
 			auth.POST("/google", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.Google)
+			auth.POST("/password/forgot", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.ForgotPassword)
+			auth.POST("/password/reset", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.ResetPassword)
 		}
 
 		// User & Profile routes (authenticated)
@@ -140,6 +140,18 @@ func NewRouter(
 		// note above. Kept out of the authenticated block below so it can't be
 		// mistaken for an authenticated route.
 		api.POST("/claim-name", userHandler.ClaimName)
+
+		// Public client configuration (Phase 2.3) — pre-login feature flags
+		// (google_enabled, arc addresses, fiat provider). GET is CSRF-safe by
+		// method; the payload carries no secrets (see ConfigHandler).
+		configHandler := handler.NewConfigHandler(handler.PublicConfig{
+			GoogleClientID:     cfg.Google.ClientID,
+			ArcChainID:         cfg.Arc.ChainID,
+			ArcCircleAddress:   cfg.Arc.CircleAddress,
+			ArcTreasuryAddress: cfg.Arc.TreasuryAddress,
+			ArcUSDCContract:    cfg.Arc.USDCContract,
+		})
+		api.GET("/config", configHandler.PublicConfig)
 
 		authenticated := api.Group("")
 		authenticated.Use(middleware.AuthMiddleware(jwtPublicKey))
@@ -316,12 +328,6 @@ func NewRouter(
 			authenticated.DELETE("/savings/goals/:id", savingsGoalHandler.Delete)
 			authenticated.POST("/savings/goals/:id/complete", savingsGoalHandler.Complete)
 
-			// Token routes
-			authenticated.GET("/token/balance/:address", tokenHandler.GetBalance)
-			authenticated.POST("/token/stake", requireIdem, tokenHandler.Stake)
-			authenticated.POST("/token/unstake", requireIdem, tokenHandler.Unstake)
-			authenticated.GET("/token/stakes/:address", tokenHandler.GetStakes)
-
 			// Swap endpoints
 			authenticated.POST("/swap/offer", requireIdem, perResource(redisClient, "swap", cfg.RateLimit.SwapLimit, cfg.RateLimit.SwapWindowSeconds), swapHandler.CreateSwapOffer)
 			authenticated.POST("/swap/accept", requireIdem, perResource(redisClient, "swap", cfg.RateLimit.SwapLimit, cfg.RateLimit.SwapWindowSeconds), swapHandler.AcceptSwapOffer)
@@ -353,8 +359,6 @@ func NewRouter(
 			admin.DELETE("/feature-flags/:flag", adminHandler.DeleteFeatureFlag)
 			admin.GET("/jobs/dead-letter", adminJobQueueHandler.GetDeadLetterJobs)
 			admin.POST("/jobs/dead-letter/:id/retry", adminJobQueueHandler.RetryDeadLetterJob)
-			admin.GET("/indexer/dead-letter", adminIndexerHandler.GetDeadLetterEvents)
-			admin.POST("/indexer/dead-letter/:id/resolve", adminIndexerHandler.ResolveDeadLetterEvent)
 		}
 
 		optional := api.Group("")

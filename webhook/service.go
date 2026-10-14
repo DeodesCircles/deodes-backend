@@ -328,7 +328,7 @@ func (d *Dispatcher) sendHTTP(ctx context.Context, targetURL, secret string, bod
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if secret != "" {
-		req.Header.Set("X-Moistello-Signature", SignWebhookPayload(body, secret))
+		req.Header.Set("X-Deodes-Signature", SignWebhookPayload(body, secret))
 	}
 	if reqID != "" {
 		req.Header.Set("X-Request-ID", reqID)

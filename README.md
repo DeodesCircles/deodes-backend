@@ -1,6 +1,6 @@
 # Deodes Backend
 
-Go REST API server powering the Deodes decentralized ROSCA platform for 1.7B+ unbanked adults. Chain rails migrating from Stellar/Soroban to Arc.
+Go REST API server powering the Deodes decentralized ROSCA platform for 1.7B+ unbanked adults. Chain: Arc (EVM).
 
 ## Business Model
 
@@ -15,7 +15,7 @@ Each circle runs for N cycles where each member contributes amount X, and one me
 
 ### Revenue Model
 - **Protocol Fee**: 0.5% on all payouts collected via Treasury contract
-- **Network Fees**: Stellar base fees <$0.001 per transaction (passed through)
+- **Network Fees**: Arc gas (USDC, 18 decimals) per transaction (passed through)
 
 ### Service Architecture
 | Service | Port | Business Purpose |
@@ -34,7 +34,7 @@ Each circle runs for N cycles where each member contributes amount X, and one me
 | Database | PostgreSQL 15+ |
 | Cache | Redis 7+ |
 | Queue | RabbitMQ |
-| Blockchain | Stellar Horizon + Soroban RPC |
+| Blockchain | Arc EVM (RPC + EIP-191 signatures) |
 | Auth | JWT RS256 |
 
 ## Business Domain Model (11 Domains)
@@ -102,7 +102,7 @@ GET /notifications          → In-app alerts
 ### Environment Variables
 ```bash
 # Database connection
-DATABASE_URL=postgres://user:pass@localhost:5432/moistello?sslmode=disable
+DATABASE_URL=postgres://user:pass@localhost:5432/deodes?sslmode=disable
 
 # Cache for rate limiting
 REDIS_URL=redis://localhost:6379/0
@@ -114,14 +114,13 @@ RABBITMQ_URL=amqp://localhost:5672
 JWT_PRIVATE_KEY_PATH=./config/keys/jwt-private.pem
 JWT_PUBLIC_KEY_PATH=./config/keys/jwt-public.pem
 
-# Stellar network
-STELLAR_HORIZON_URL=https://horizon-testnet.stellar.org
-STELLAR_RPC_URL=https://soroban-testnet.stellar.org
-STELLAR_NETWORK_PASSPHRASE=Test SDF Network ; September 2015
+# Arc network (testnet defaults; chain 5042002, mainnet 5042)
+ARC_RPC_URL=https://rpc.testnet.arc.io
+ARC_CHAIN_ID=5042002
 
 # Graceful shutdown (also server.shutdown_delay / server.shutdown_timeout in config.yaml)
-MOISTELLO_SERVER_SHUTDOWN_DELAY=0s      # keep serving after readiness fails so balancers drain us
-MOISTELLO_SERVER_SHUTDOWN_TIMEOUT=30s   # drain deadline; open connections are closed forcibly after it
+DEODES_SERVER_SHUTDOWN_DELAY=0s      # keep serving after readiness fails so balancers drain us
+DEODES_SERVER_SHUTDOWN_TIMEOUT=30s   # drain deadline; open connections are closed forcibly after it
 ```
 
 ### Shutdown Sequence
@@ -135,7 +134,7 @@ Postgres, Redis and RabbitMQ pools. Exceeding the timeout closes the remaining c
 ### Authentication
 1. Client requests nonce via `/auth/nonce`
 2. Server generates time-bound challenge (5 min TTL)
-3. Client signs challenge with Stellar wallet
+3. Client signs challenge with Arc wallet (EIP-191 personal_sign)
 4. Server verifies Ed25519 signature
 5. JWT pair issued (RS256 signed)
 
@@ -172,13 +171,10 @@ Redis token bucket with sliding window, preventing API abuse.
 ```bash
 go test ./...              # Unit tests
 go test -v ./internal/api/handler/...  # Specific package
-go test ./pkg/stellar/...  # Stellar client contract tests against the offline Horizon/RPC mock
+go test ./pkg/arc/...      # Arc client tests (offline; no network access needed)
 ```
 
-The Stellar clients are pinned by contract tests in `pkg/stellar` and `pkg/stellar/soroban` that run
-against `pkg/stellar/stellartest`, an in-process Horizon + Soroban RPC mock. No network access is needed.
-
-Balances and amounts are handled by `pkg/money`, a seven-decimal fixed-point type (stroops underneath).
+Balances and amounts are handled by `pkg/money`, a seven-decimal fixed-point type (minor units underneath).
 Convert at the edges with `money.FromFloat64` / `money.FromString` and keep arithmetic on `Money`.
 
 Test coverage: 85% across 11 packages (127 tests).
@@ -186,7 +182,7 @@ Test coverage: 85% across 11 packages (127 tests).
 ## Deployment
 
 ```bash
-docker build -t moistello/backend .
+docker build -t deodes/backend .
 docker-compose -f docker-compose.prod.yml up
 ```
 

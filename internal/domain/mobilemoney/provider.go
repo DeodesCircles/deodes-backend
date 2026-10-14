@@ -1,8 +1,7 @@
 // Package mobilemoney implements the mobile-money bridge described in
-// product-spec.md §7 (Phase 2): off-ramp/on-ramp between USDC on Stellar and
+// product-spec.md §7 (Phase 2): off-ramp/on-ramp between USDC on Arc and
 // mobile-money wallets (M-Pesa, MTN Mobile Money, Airtel Money) for non-NGN
-// African markets. NGN already has a dedicated bridge via
-// internal/domain/yellowcard; this package covers everything else.
+// African markets.
 package mobilemoney
 
 import "context"
@@ -25,7 +24,7 @@ type OnrampRequest struct {
 	Amount             float64
 	Currency           string // provider's local currency, e.g. "KES", "UGX", "GHS"
 	PhoneNumber        string // MSISDN in international format, e.g. "254712345678"
-	DestinationAddress string // Stellar public key to receive USDC
+	DestinationAddress string // Arc (0x) address to receive USDC
 	Reference          string // caller-supplied idempotent reference
 }
 
@@ -39,7 +38,7 @@ type OnrampResult struct {
 
 // OfframpRequest asks a provider to disburse funds to a customer's mobile
 // money wallet (e.g. an M-Pesa B2C payment) after USDC has been received
-// from the customer's Stellar wallet.
+// from the customer's Arc wallet.
 type OfframpRequest struct {
 	Amount      float64
 	Currency    string

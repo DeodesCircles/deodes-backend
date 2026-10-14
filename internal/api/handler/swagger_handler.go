@@ -11,7 +11,7 @@ const swaggerHTMLTemplate = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Moistello API Documentation - Swagger UI</title>
+  <title>Deodes API Documentation - Swagger UI</title>
   <link rel="stylesheet" type="text/css" href="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.11.0/swagger-ui.min.css" />
   <style>
     html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }
@@ -51,7 +51,7 @@ type SwaggerHandler struct {
 func NewSwaggerHandler() *SwaggerHandler {
 	b, err := os.ReadFile("src/openapi/openapi3.json")
 	if err != nil {
-		b = []byte(`{"openapi":"3.1.0","info":{"title":"Moistello API","version":"1.0.0"}}`)
+		b = []byte(`{"openapi":"3.1.0","info":{"title":"Deodes API","version":"1.0.0"}}`)
 	}
 	return &SwaggerHandler{specJSON: b}
 }

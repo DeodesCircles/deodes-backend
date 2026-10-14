@@ -132,7 +132,7 @@ func (r *pgRepo) List(ctx context.Context, filter CircleFilter) ([]Circle, error
 		contribution_amount, currency, frequency, max_members, min_moi_score,
 		collateral_percent, late_fee_percent, grace_period_hours, max_strikes,
 		COALESCE(member_counts.member_count, 0) as member_count,
-		requires_invite,
+		requires_invite, auto_debit,
 		start_date, end_date, status, current_round, total_contributions,
 		organizer_id, created_at, updated_at FROM circles
 		LEFT JOIN (
@@ -151,13 +151,19 @@ func (r *pgRepo) List(ctx context.Context, filter CircleFilter) ([]Circle, error
 		searchPattern := "%" + filter.Search + "%"
 		args = append(args, searchPattern, searchPattern)
 	}
-	if filter.Status != "" {
+	if filter.OpenOnly {
+		whereClauses = append(whereClauses, "status IN ('pending','active')")
+	} else if filter.Status != "" {
 		whereClauses = append(whereClauses, "status = $"+fmt.Sprint(len(args)+1))
 		args = append(args, filter.Status)
 	}
 	if filter.Type != "" {
 		whereClauses = append(whereClauses, "circle_type = $"+fmt.Sprint(len(args)+1))
 		args = append(args, filter.Type)
+	}
+	if filter.Currency != "" {
+		whereClauses = append(whereClauses, "currency = $"+fmt.Sprint(len(args)+1))
+		args = append(args, filter.Currency)
 	}
 	if filter.CommunityID != nil {
 		whereClauses = append(whereClauses, "community_id = $"+fmt.Sprint(len(args)+1))
@@ -180,7 +186,8 @@ func (r *pgRepo) List(ctx context.Context, filter CircleFilter) ([]Circle, error
 		query += " AND " + strings.Join(whereClauses, " AND ")
 	}
 
-	query += " ORDER BY created_at DESC LIMIT $" + fmt.Sprint(len(args)+1) + " OFFSET $" + fmt.Sprint(len(args)+2)
+	query += " " + circleListOrderBy(filter.SortBy, filter.SortOrder)
+	query += " LIMIT $" + fmt.Sprint(len(args)+1) + " OFFSET $" + fmt.Sprint(len(args)+2)
 	args = append(args, limit, offset)
 
 	rows, err := r.db.QueryxContext(ctx, query, args...)
@@ -213,13 +220,19 @@ func (r *pgRepo) Count(ctx context.Context, filter CircleFilter) (int, error) {
 		searchPattern := "%" + filter.Search + "%"
 		args = append(args, searchPattern, searchPattern)
 	}
-	if filter.Status != "" {
+	if filter.OpenOnly {
+		whereClauses = append(whereClauses, "status IN ('pending','active')")
+	} else if filter.Status != "" {
 		whereClauses = append(whereClauses, "status = $"+fmt.Sprint(len(args)+1))
 		args = append(args, filter.Status)
 	}
 	if filter.Type != "" {
 		whereClauses = append(whereClauses, "circle_type = $"+fmt.Sprint(len(args)+1))
 		args = append(args, filter.Type)
+	}
+	if filter.Currency != "" {
+		whereClauses = append(whereClauses, "currency = $"+fmt.Sprint(len(args)+1))
+		args = append(args, filter.Currency)
 	}
 	if filter.CommunityID != nil {
 		whereClauses = append(whereClauses, "community_id = $"+fmt.Sprint(len(args)+1))
@@ -228,6 +241,14 @@ func (r *pgRepo) Count(ctx context.Context, filter CircleFilter) (int, error) {
 	if filter.OrganizerID != nil {
 		whereClauses = append(whereClauses, "organizer_id = $"+fmt.Sprint(len(args)+1))
 		args = append(args, *filter.OrganizerID)
+	}
+	if len(filter.ExcludeIDs) > 0 {
+		placeholders := make([]string, len(filter.ExcludeIDs))
+		for i, id := range filter.ExcludeIDs {
+			placeholders[i] = "$" + fmt.Sprint(len(args)+1+i)
+			args = append(args, id)
+		}
+		whereClauses = append(whereClauses, "id NOT IN ("+strings.Join(placeholders, ",")+")")
 	}
 
 	if len(whereClauses) > 0 {
@@ -240,6 +261,28 @@ func (r *pgRepo) Count(ctx context.Context, filter CircleFilter) (int, error) {
 		return 0, fmt.Errorf("counting circles: %w", err)
 	}
 	return count, nil
+}
+
+// circleListOrderBy maps the public sort keys accepted by GET /circles to
+// ORDER BY fragments. Unknown keys fall back to newest-first so a bad client
+// value can never inject SQL or break discovery.
+func circleListOrderBy(sortBy, sortOrder string) string {
+	dir := "DESC"
+	if sortOrder == "asc" {
+		dir = "ASC"
+	}
+	switch sortBy {
+	case "name":
+		return "ORDER BY name " + dir + ", created_at DESC"
+	case "amount":
+		return "ORDER BY contribution_amount " + dir + ", created_at DESC"
+	case "members":
+		return "ORDER BY COALESCE(member_counts.member_count, 0) " + dir + ", created_at DESC"
+	case "date", "":
+		return "ORDER BY created_at " + dir
+	default:
+		return "ORDER BY created_at DESC"
+	}
 }
 
 func (r *pgRepo) Create(ctx context.Context, c *Circle) error {

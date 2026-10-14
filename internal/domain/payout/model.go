@@ -31,6 +31,12 @@ const (
 // for the same round is a conflict — never a second payout.
 var ErrRoundAlreadyPaid = errors.New("payout already recorded for this circle round")
 
+// ErrRecipientAlreadyPaid is returned when a random-rotation payout names a
+// member who has already been paid in the current rotation. Random payouts
+// rotate without repeat: every member is paid exactly once per rotation, so a
+// repeat recipient is rejected — never recorded.
+var ErrRecipientAlreadyPaid = errors.New("member has already received a payout in this rotation")
+
 type Payout struct {
 	ID                 uuid.UUID          `json:"id" db:"id"`
 	CircleID           uuid.UUID          `json:"circleId" db:"circle_id"`

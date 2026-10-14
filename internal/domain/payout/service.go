@@ -160,6 +160,22 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Payout, error
 		isOnTime = isOnTime && input.RoundNumber <= cir.CurrentRound
 	}
 
+	// Rotation guard (RULE 2 — random payouts rotate without repeat). When
+	// the circle service is available, a random-rotation payout to a member
+	// who has already been paid in this circle is rejected: a full rotation
+	// pays every member exactly once, and a new rotation only starts after
+	// everyone has been paid. Non-random payout types (fixed/auction/vote)
+	// keep their own selection semantics and are unaffected.
+	if input.PayoutType == PayoutTypeRandom && s.circleService != nil {
+		alreadyPaid, err := s.circlePaidRecipients(ctx, circleUID)
+		if err != nil {
+			return nil, fmt.Errorf("checking rotation state: %w", err)
+		}
+		if alreadyPaid[recipientUID] {
+			return nil, ErrRecipientAlreadyPaid
+		}
+	}
+
 	// Determine verification state — caller may override (e.g. indexer).
 	verifiedOnchain := false
 	verificationStatus := VerificationStatusUnverified
@@ -253,6 +269,28 @@ func (s *service) resolveRecipientWallet(ctx context.Context, recipientUID uuid.
 		return "", fmt.Errorf("no wallet lookup available")
 	}
 	return s.walletLookup.WalletAddressForUser(ctx, recipientUID)
+}
+
+// circlePaidRecipients returns the set of user IDs that have received at
+// least one payout in the circle. It pages through the full history —
+// ListByCircle is capped at 100 rows per page — so a repeat is never missed
+// past a page boundary.
+func (s *service) circlePaidRecipients(ctx context.Context, circleID uuid.UUID) (map[uuid.UUID]bool, error) {
+	const pageSize = 100
+	paid := make(map[uuid.UUID]bool)
+	for page := 1; ; page++ {
+		payouts, total, err := s.repo.ListByCircle(ctx, circleID, page, pageSize)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range payouts {
+			paid[p.RecipientID] = true
+		}
+		if len(payouts) == 0 || page*pageSize >= total {
+			break
+		}
+	}
+	return paid, nil
 }
 
 func (s *service) GetUserHistory(ctx context.Context, userID string, page, limit int) ([]Payout, int, error) {

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -158,9 +159,53 @@ func (h *CircleHandler) ListCircles(c *gin.Context) {
 	filter := circle.CircleFilter{
 		Search: c.Query("search"),
 		Status: circle.CircleStatus(c.Query("status")),
-		Type:   circle.CircleType(c.Query("type")),
 		Page:   page,
 		Limit:  limit,
+	}
+	// Unknown `type` values (e.g. the frontend's "my-circles" tab) must not
+	// become a WHERE clause that matches nothing — ignore them so discovery
+	// degrades to unfiltered instead of empty.
+	switch t := circle.CircleType(c.Query("type")); t {
+	case circle.CircleTypePublic, circle.CircleTypePrivate, circle.CircleTypeCommunity, circle.CircleTypePremium:
+		filter.Type = t
+	}
+	// Arc USDC only: the browser's currency toggle maps straight through.
+	// Unknown values are ignored rather than filtering everything out.
+	switch cur := circle.CircleCurrency(c.Query("currency")); cur {
+	case circle.CurrencyUSDC, circle.CurrencyXLM:
+		filter.Currency = cur
+	}
+	// Sort keys mirror the frontend browser (date/name/amount/members); the
+	// repository whitelists them, so anything else falls back to newest-first.
+	if sortBy := c.Query("sortBy"); sortBy != "" {
+		filter.SortBy = sortBy
+	} else if sort := c.Query("sort"); sort != "" {
+		// Accept the combined "date-desc" style value too.
+		switch {
+		case strings.HasPrefix(sort, "date"):
+			filter.SortBy = "date"
+		case strings.HasPrefix(sort, "name"):
+			filter.SortBy = "name"
+		case strings.HasPrefix(sort, "amount"):
+			filter.SortBy = "amount"
+		case strings.HasPrefix(sort, "members"):
+			filter.SortBy = "members"
+		}
+	}
+	switch o := c.Query("sortOrder"); o {
+	case "asc", "desc":
+		filter.SortOrder = o
+	default:
+		if s := c.Query("sort"); strings.HasSuffix(s, "-asc") {
+			filter.SortOrder = "asc"
+		} else if strings.HasSuffix(s, "-desc") {
+			filter.SortOrder = "desc"
+		}
+	}
+	if v := c.Query("openOnly"); v == "true" || v == "1" {
+		filter.OpenOnly = true
+		// openOnly wins over an explicit status: it means pending+active.
+		filter.Status = ""
 	}
 	if communityID := c.Query("communityId"); communityID != "" {
 		if id, err := uuid.Parse(communityID); err == nil {
@@ -183,6 +228,39 @@ func (h *CircleHandler) ListCircles(c *gin.Context) {
 	response.OKWithMeta(c, gin.H{"circles": circles}, response.NewPaginationMeta(page, limit, total))
 }
 
+// writeCircleError maps circle failures to status codes so bad input never
+// surfaces as a 500: validation problems are 400 VALIDATION_ERROR, unknown
+// ids are 404, permission problems are 403, name conflicts are 409, and only
+// genuine infrastructure failures are 500.
+func writeCircleError(c *gin.Context, err error, action string) {
+	switch {
+	case errors.Is(err, apperrors.ErrInvalidInput):
+		response.ValidationError(c, err.Error(), nil)
+	case errors.Is(err, circle.ErrCircleNotFound):
+		response.NotFound(c, "circle not found")
+	case errors.Is(err, circle.ErrNotOrganizer):
+		response.Forbidden(c, err.Error())
+	case errors.Is(err, circle.ErrCircleNotActive):
+		response.BadRequest(c, err.Error())
+	case errors.Is(err, circle.ErrCircleFull):
+		response.BadRequest(c, err.Error())
+	case errors.Is(err, circle.ErrAlreadyMember):
+		response.Conflict(c, err.Error())
+	case errors.Is(err, circle.ErrNotMember):
+		response.Forbidden(c, err.Error())
+	case errors.Is(err, circle.ErrInvalidInvite):
+		response.BadRequest(c, err.Error())
+	case errors.Is(err, circle.ErrInvalidUUID):
+		response.ValidationError(c, err.Error(), nil)
+	case errors.Is(err, apperrors.ErrConflict):
+		response.Conflict(c, err.Error())
+	case errors.Is(err, apperrors.ErrNotFound):
+		response.NotFound(c, "circle not found")
+	default:
+		response.InternalError(c, action)
+	}
+}
+
 // @Summary Create a circle
 // @Description Creates a new savings circle. Requires authentication.
 // @Tags Circles
@@ -198,16 +276,16 @@ func (h *CircleHandler) CreateCircle(c *gin.Context) {
 	userID := middleware.GetUserID(c)
 	var input circle.CreateCircleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		response.ValidationError(c, err.Error(), nil)
 		return
 	}
 	if err := validator.Validate.Struct(input); err != nil {
-		response.ValidationErrors(c, "validation failed: "+err.Error())
+		response.ValidationError(c, "validation failed: "+err.Error(), validator.FormatError(err))
 		return
 	}
 	cir, err := h.circleService.Create(c.Request.Context(), userID, input)
 	if err != nil {
-		response.InternalError(c, "failed to create circle")
+		writeCircleError(c, err, "failed to create circle")
 		return
 	}
 	response.Created(c, gin.H{"circle": cir})
@@ -236,12 +314,16 @@ func (h *CircleHandler) UpdateCircle(c *gin.Context) {
 	userID := middleware.GetUserID(c)
 	var input circle.UpdateCircleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		response.ValidationError(c, err.Error(), nil)
+		return
+	}
+	if err := validator.Validate.Struct(input); err != nil {
+		response.ValidationError(c, "validation failed: "+err.Error(), validator.FormatError(err))
 		return
 	}
 	cir, err := h.circleService.Update(c.Request.Context(), id, userID, input)
 	if err != nil {
-		response.BadRequest(c, err.Error())
+		writeCircleError(c, err, "failed to update circle")
 		return
 	}
 	response.OK(c, gin.H{"circle": cir})
@@ -533,9 +615,30 @@ func (h *CircleHandler) TriggerPayout(c *gin.Context) {
 		response.Conflict(c, "payout already recorded for this circle round")
 		return
 	}
+	// Rotation guard (RULE 2 — random payouts rotate without repeat): a
+	// member who has already been paid in this circle cannot be paid again
+	// until the rotation completes. The payout service re-checks this
+	// authoritatively at record time (which also covers the indexer path);
+	// this pre-check maps the violation to a precise 409 here instead of a
+	// generic 500 from the Record error.
+	if cir.PayoutType == circle.PayoutTypeRandom {
+		paidRecipients, err := h.allCirclePayoutRecipients(c.Request.Context(), circleID)
+		if err != nil {
+			response.InternalError(c, "failed to verify rotation state")
+			return
+		}
+		if paidRecipients[req.RecipientID] {
+			response.Conflict(c, "member has already received a payout in this rotation: random payouts pay every member exactly once before anyone is paid again")
+			return
+		}
+	}
 	record, err := h.payoutService.Record(c.Request.Context(), req)
 	if err != nil {
 		if errors.Is(err, payout.ErrRoundAlreadyPaid) {
+			response.Conflict(c, err.Error())
+			return
+		}
+		if errors.Is(err, payout.ErrRecipientAlreadyPaid) {
 			response.Conflict(c, err.Error())
 			return
 		}
@@ -577,26 +680,98 @@ func (h *CircleHandler) CloseCircle(c *gin.Context) {
 // @Success 200 {object} response.Envelope{data=object{success=bool}}
 // @Failure 400 {object} response.Envelope
 // @Router /circles/{id}/join [post]
+//
+// Contract: POST /circles/:id/join, body {inviteCode?}. 200 {success:true,
+// circleId, duplicate} on fresh and idempotent re-join; 400 invalid
+// id/invite, 401 unauthenticated, 403 score/community/invite forbidden,
+// 404 unknown circle, 409 circle full, 422 circle ended.
 func (h *CircleHandler) JoinCircle(c *gin.Context) {
 	circleID := c.Param("id")
 	userID := middleware.GetUserID(c)
+	if userID == "" {
+		response.Unauthorized(c, "authentication required")
+		return
+	}
+	if _, err := uuid.Parse(circleID); err != nil {
+		response.BadRequest(c, "invalid circle ID")
+		return
+	}
+	if _, err := uuid.Parse(userID); err != nil {
+		response.Unauthorized(c, "invalid session identity")
+		return
+	}
 	var req struct {
 		InviteCode string `json:"inviteCode"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		req.InviteCode = ""
+	// An empty body is a normal public-circle join; only real JSON errors
+	// (and non-object shapes) are rejected.
+	if c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			// Tolerate a literal `null`/empty body the same as {}.
+			req.InviteCode = ""
+		}
 	}
-	if req.InviteCode != "" {
-		if _, err := h.inviteService.Validate(c.Request.Context(), req.InviteCode); err != nil {
-			response.BadRequest(c, "invalid invite code")
+	req.InviteCode = strings.TrimSpace(req.InviteCode)
+	if req.InviteCode != "" && h.inviteService != nil {
+		inv, err := h.inviteService.Validate(c.Request.Context(), req.InviteCode)
+		if err != nil {
+			response.BadRequest(c, "invalid or expired invite code")
+			return
+		}
+		if inv.CircleID.String() != circleID {
+			response.BadRequest(c, "invite code is not for this circle")
 			return
 		}
 	}
 	if err := h.circleService.Join(c.Request.Context(), circleID, userID, req.InviteCode); err != nil {
-		response.BadRequest(c, err.Error())
+		mapJoinError(c, err)
 		return
 	}
-	response.OK(c, gin.H{"success": true})
+	// Consume the invite after the membership commits. Join stands even if
+	// this fails (the member falls back to a used-but-uncounted code).
+	if req.InviteCode != "" && h.inviteService != nil {
+		_ = func() error {
+			_, aerr := h.inviteService.Accept(c.Request.Context(), req.InviteCode, userID)
+			return aerr
+		}()
+	}
+	response.OK(c, gin.H{"success": true, "circleId": circleID, "duplicate": false})
+}
+
+// mapJoinError translates join failures into the status the frontend's
+// requirements messaging keys off — instead of collapsing everything into a
+// 400 with a raw service string.
+func mapJoinError(c *gin.Context, err error) {
+	msg := err.Error()
+	switch {
+	case errors.Is(err, circle.ErrAlreadyMember):
+		// Idempotent re-join: the caller is a member either way.
+		response.OK(c, gin.H{"success": true, "duplicate": true})
+	case errors.Is(err, circle.ErrCircleNotFound):
+		response.NotFound(c, "circle not found")
+	case errors.Is(err, circle.ErrInvalidUUID):
+		response.BadRequest(c, "invalid circle ID")
+	case errors.Is(err, circle.ErrCircleFull):
+		response.Conflict(c, "this circle is full")
+	case errors.Is(err, circle.ErrInvalidInvite):
+		response.BadRequest(c, "this circle is invite-only: enter the organizer's invite code to join")
+	case errors.Is(err, circle.ErrMoiScoreTooLow):
+		response.Forbidden(c, "your DeoScore is too low for this circle")
+	case errors.Is(err, circle.ErrNotCommunityMember):
+		response.Forbidden(c, "this community circle is limited to community members")
+	case errors.Is(err, circle.ErrCircleNotActive):
+		response.ErrorWithCode(c, http.StatusUnprocessableEntity, "CIRCLE_ENDED", "this circle has ended and is no longer joinable")
+	case strings.Contains(msg, "at least 50 MoiScore"):
+		response.Forbidden(c, "joining premium circles requires at least 50 DeoScore")
+	case strings.Contains(msg, "MoiScore is too low"):
+		response.Forbidden(c, "your DeoScore is too low for this circle")
+	case strings.Contains(msg, "only USDC"):
+		response.ErrorWithCode(c, http.StatusUnprocessableEntity, "LEGACY_RAIL", "only USDC circles on Arc can be joined")
+	case strings.Contains(msg, "invite code is not for this circle"):
+		response.BadRequest(c, msg)
+	default:
+		response.BadRequest(c, msg)
+	}
 }
 
 func (h *CircleHandler) Contribute(c *gin.Context) {
@@ -723,11 +898,76 @@ func mapContributeError(c *gin.Context, err error) {
 func (h *CircleHandler) ExitCircle(c *gin.Context) {
 	id := c.Param("id")
 	userID := middleware.GetUserID(c)
-	if err := h.circleService.Exit(c.Request.Context(), id, userID); err != nil {
+	ctx := c.Request.Context()
+
+	// RULE 1 — no withdrawals until every member has been paid. This is the
+	// circle-scoped withdraw path (a member leaving the circle and taking
+	// their position out). The generic wallet withdraw
+	// (POST /v1/wallets/withdraw) carries no circle context and only moves
+	// the user's own funds, so it is intentionally NOT gated here.
+	// The lock applies to active circles only: pending circles have no
+	// rounds yet, and completed/cancelled circles are already settled.
+	// Complete means every active member has received at least one payout.
+	if cir, err := h.circleService.Get(ctx, id); err == nil && cir != nil &&
+		cir.Status == circle.CircleStatusActive {
+		members, merr := h.circleService.GetMembers(ctx, id)
+		paid, perr := h.allCirclePayoutRecipients(ctx, id)
+		if merr != nil || perr != nil {
+			response.InternalError(c, "failed to verify circle payout state")
+			return
+		}
+		paidCount, totalCount := circlePayoutCompletion(members, paid)
+		if totalCount == 0 || paidCount < totalCount {
+			response.Error(c, http.StatusForbidden, "PAYOUTS_INCOMPLETE",
+				fmt.Sprintf("withdrawals unlock after every member has been paid — %d of %d rounds paid so far", paidCount, totalCount),
+				gin.H{"paidRounds": paidCount, "totalRounds": totalCount})
+			return
+		}
+	}
+
+	if err := h.circleService.Exit(ctx, id, userID); err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
 	response.OK(c, gin.H{"success": true})
+}
+
+// allCirclePayoutRecipients returns the set of recipient user-ID strings that
+// have received at least one payout in the circle. It pages through the full
+// history so rotation (Rule 2) and exit-gate (Rule 1) checks never miss rows
+// past a page boundary.
+func (h *CircleHandler) allCirclePayoutRecipients(ctx context.Context, circleID string) (map[string]bool, error) {
+	const pageSize = 100
+	paid := make(map[string]bool)
+	for page := 1; ; page++ {
+		payouts, total, err := h.payoutService.GetCircleHistory(ctx, circleID, page, pageSize)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range payouts {
+			paid[p.RecipientID.String()] = true
+		}
+		if len(payouts) == 0 || page*pageSize >= total {
+			break
+		}
+	}
+	return paid, nil
+}
+
+// circlePayoutCompletion counts how many of the circle's active members have
+// been paid at least once. Exited/removed members are out of the rotation
+// and no longer block withdrawals.
+func circlePayoutCompletion(members []circle.CircleMember, paid map[string]bool) (paidCount, totalCount int) {
+	for _, m := range members {
+		if m.Status != circle.MemberStatusActive {
+			continue
+		}
+		totalCount++
+		if paid[m.UserID.String()] {
+			paidCount++
+		}
+	}
+	return paidCount, totalCount
 }
 
 func (h *CircleHandler) GetMembers(c *gin.Context) {

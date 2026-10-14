@@ -10,6 +10,10 @@ type CircleFilter struct {
 	Search      string
 	Status      CircleStatus
 	Type        CircleType
+	Currency    CircleCurrency
+	SortBy      string
+	SortOrder   string
+	OpenOnly    bool
 	Page        int
 	Limit       int
 	ExcludeIDs  []uuid.UUID

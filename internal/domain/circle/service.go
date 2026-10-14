@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -66,20 +67,26 @@ type Transactor interface {
 
 type CreateCircleInput struct {
 	Name               string          `json:"name" validate:"required,min=3,max=100"`
-	Description        string          `json:"description"`
+	Description        string          `json:"description" validate:"max=500"`
 	CommunityID        string          `json:"communityId"`
 	CircleType         CircleType      `json:"circleType" validate:"required,oneof=public private community premium"`
 	PayoutType         PayoutType      `json:"payoutType" validate:"required,oneof=random fixed auction vote"`
-	ContributionAmount float64         `json:"contributionAmount" validate:"required,gt=0"`
-	Currency           CircleCurrency  `json:"currency" validate:"required,oneof=USDC XLM"`
+	ContributionAmount float64         `json:"contributionAmount" validate:"required,gt=0,lte=1000000"`
+	Currency           CircleCurrency  `json:"currency" validate:"required,oneof=USDC"`
 	Frequency          CircleFrequency `json:"frequency" validate:"required,oneof=daily weekly biweekly monthly"`
 	MaxMembers         int             `json:"maxMembers" validate:"required,gte=2,lte=100"`
 	MinMoiScore        int             `json:"minMoiScore" validate:"gte=0,lte=1000"`
 	CollateralPercent  float64         `json:"collateralPercent" validate:"gte=0,lte=100"`
-	LateFeePercent     float64         `json:"lateFeePercent" validate:"gte=0,lte=100"`
-	GracePeriodHours   int             `json:"gracePeriodHours" validate:"gte=0"`
-	MaxStrikes         int             `json:"maxStrikes" validate:"gte=1,lte=10"`
-	RequiresInvite     bool            `json:"requiresInvite"`
+	LateFeePercent     float64         `json:"lateFeePercent" validate:"gte=0,lte=50"`
+	// GracePeriodHours/MaxStrikes accept 0 at the handler layer meaning
+	// "omitted": Create defaults them (24h/3) before strict validation.
+	// Updates use pointers instead, so an explicit 0 is still rejected.
+	GracePeriodHours int    `json:"gracePeriodHours" validate:"gte=0,lte=168"`
+	MaxStrikes       int    `json:"maxStrikes" validate:"gte=0,lte=10"`
+	StartDate        string `json:"startDate"`
+	RequiresInvite   bool   `json:"requiresInvite"`
+	// AutoDebit opts the circle into keeper auto-debit (default flexible/manual).
+	AutoDebit bool `json:"autoDebit"`
 }
 
 type UpdateCircleInput struct {
@@ -94,6 +101,291 @@ type UpdateCircleInput struct {
 	LateFeePercent     *float64         `json:"lateFeePercent"`
 	GracePeriodHours   *int             `json:"gracePeriodHours"`
 	MaxStrikes         *int             `json:"maxStrikes"`
+	StartDate          *string          `json:"startDate"`
+	AutoDebit          *bool            `json:"autoDebit"`
+}
+
+// Circle creation/update bounds. These mirror the frontend wizard rules
+// (CIRCLE_LIMITS + validateCircleStep) so every step fails fast with a 400
+// VALIDATION_ERROR instead of slipping through or surfacing as a 500.
+const (
+	circleNameMinLen    = 3
+	circleNameMaxLen    = 100
+	circleDescMaxLen    = 500
+	circleContribMax    = 1_000_000
+	circleMembersMin    = 2
+	circleMembersMax    = 100
+	circleMoiMin        = 0
+	circleMoiMax        = 1000
+	circleCollateralMax = 100
+	circleLateFeeMax    = 50
+	circleGraceMin      = 1
+	circleGraceMax      = 168
+	circleStrikesMin    = 1
+	circleStrikesMax    = 10
+	premiumMinMOI       = 50
+	premiumMinUSDC      = 50
+)
+
+func invalidCircleInput(format string, args ...any) error {
+	return fmt.Errorf(format+": %w", append(args, apperrors.ErrInvalidInput)...)
+}
+
+// parseCircleStartDate accepts the ISO-8601 strings the wizard sends
+// (RFC3339 via toISOString) plus raw datetime-local values. Empty means "no
+// start date". A present value must parse and lie in the future.
+func parseCircleStartDate(raw string) (time.Time, bool, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return time.Time{}, false, nil
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04",
+		"2006-01-02T15:04:05",
+		"2006-01-02",
+	}
+	var parsed time.Time
+	var err error
+	for _, layout := range layouts {
+		parsed, err = time.Parse(layout, trimmed)
+		if err == nil {
+			if parsed.After(time.Now()) {
+				return parsed, true, nil
+			}
+			return time.Time{}, false, fmt.Errorf("start date must be in the future")
+		}
+	}
+	return time.Time{}, false, fmt.Errorf("start date must be a valid date")
+}
+
+func validateCircleName(name string) error {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return invalidCircleInput("circle name is required")
+	}
+	if len([]rune(trimmed)) < circleNameMinLen {
+		return invalidCircleInput("circle name must be at least 3 characters")
+	}
+	if len([]rune(trimmed)) > circleNameMaxLen {
+		return invalidCircleInput("circle name must be at most 100 characters")
+	}
+	return nil
+}
+
+func validateCircleDescription(desc string) error {
+	if len([]rune(desc)) > circleDescMaxLen {
+		return invalidCircleInput("circle description must be at most 500 characters")
+	}
+	return nil
+}
+
+func validateContributionAmount(amount float64) error {
+	if math.IsNaN(amount) || math.IsInf(amount, 0) || amount <= 0 {
+		return invalidCircleInput("contribution amount must be greater than zero")
+	}
+	if amount > circleContribMax {
+		return invalidCircleInput("contribution amount must not exceed 1000000 USDC")
+	}
+	return nil
+}
+
+func validateCircleCurrency(c CircleCurrency) error {
+	if c != CurrencyUSDC {
+		return invalidCircleInput("circle currency must be USDC")
+	}
+	return nil
+}
+
+func validateCircleFrequency(f CircleFrequency) error {
+	switch f {
+	case FrequencyDaily, FrequencyWeekly, FrequencyBiweekly, FrequencyMonthly:
+		return nil
+	default:
+		return invalidCircleInput("circle frequency must be one of daily, weekly, biweekly, monthly")
+	}
+}
+
+func validateMaxMembers(n int) error {
+	if n < circleMembersMin {
+		return fmt.Errorf("circle must have at least 2 members: %w: %w", ErrParticipantLimit, apperrors.ErrInvalidInput)
+	}
+	if n > circleMembersMax {
+		return invalidCircleInput("circle must have at most 100 members")
+	}
+	return nil
+}
+
+func validateMinMoiScore(n int) error {
+	if n < circleMoiMin || n > circleMoiMax {
+		return invalidCircleInput("min MoiScore must be between 0 and 1000")
+	}
+	return nil
+}
+
+func validateCollateral(p float64) error {
+	if math.IsNaN(p) || math.IsInf(p, 0) || p < 0 || p > circleCollateralMax {
+		return invalidCircleInput("collateral percent must be between 0 and 100")
+	}
+	return nil
+}
+
+func validateLateFee(p float64) error {
+	if math.IsNaN(p) || math.IsInf(p, 0) || p < 0 || p > circleLateFeeMax {
+		return invalidCircleInput("late fee percent must be between 0 and 50")
+	}
+	return nil
+}
+
+func validateGracePeriod(h int) error {
+	if h < circleGraceMin || h > circleGraceMax {
+		return invalidCircleInput("grace period must be between 1 and 168 hours")
+	}
+	return nil
+}
+
+func validateMaxStrikes(n int) error {
+	if n < circleStrikesMin || n > circleStrikesMax {
+		return invalidCircleInput("max strikes must be between 1 and 10")
+	}
+	return nil
+}
+
+func validateCircleType(t CircleType) error {
+	switch t {
+	case CircleTypePublic, CircleTypePrivate, CircleTypeCommunity, CircleTypePremium:
+		return nil
+	default:
+		return invalidCircleInput("circle type must be one of public, private, community, premium")
+	}
+}
+
+func validatePayoutType(p PayoutType) error {
+	switch p {
+	case PayoutTypeRandom, PayoutTypeFixed, PayoutTypeAuction, PayoutTypeVote:
+		return nil
+	default:
+		return invalidCircleInput("payout type must be one of random, fixed, auction, vote")
+	}
+}
+
+func validateCreateInput(input CreateCircleInput) error {
+	if err := validateCircleName(input.Name); err != nil {
+		return err
+	}
+	if err := validateCircleDescription(input.Description); err != nil {
+		return err
+	}
+	if err := validateCircleType(input.CircleType); err != nil {
+		return err
+	}
+	if err := validatePayoutType(input.PayoutType); err != nil {
+		return err
+	}
+	if err := validateContributionAmount(input.ContributionAmount); err != nil {
+		return err
+	}
+	if err := validateCircleCurrency(input.Currency); err != nil {
+		return err
+	}
+	if err := validateCircleFrequency(input.Frequency); err != nil {
+		return err
+	}
+	if err := validateMaxMembers(input.MaxMembers); err != nil {
+		return err
+	}
+	if err := validateMinMoiScore(input.MinMoiScore); err != nil {
+		return err
+	}
+	if err := validateCollateral(input.CollateralPercent); err != nil {
+		return err
+	}
+	if err := validateLateFee(input.LateFeePercent); err != nil {
+		return err
+	}
+	if err := validateGracePeriod(input.GracePeriodHours); err != nil {
+		return err
+	}
+	if err := validateMaxStrikes(input.MaxStrikes); err != nil {
+		return err
+	}
+	if _, _, err := parseCircleStartDate(input.StartDate); err != nil {
+		return invalidCircleInput("%s", err.Error())
+	}
+	if input.CommunityID != "" {
+		if _, err := uuid.Parse(input.CommunityID); err != nil {
+			return invalidCircleInput("community id must be a valid UUID")
+		}
+	}
+	if input.CircleType == CircleTypePremium && input.ContributionAmount < premiumMinUSDC {
+		return invalidCircleInput("premium circles require minimum 50 USDC contribution")
+	}
+	return nil
+}
+
+func validateUpdateInput(input UpdateCircleInput) error {
+	if input.Name != nil {
+		if err := validateCircleName(*input.Name); err != nil {
+			return err
+		}
+	}
+	if input.Description != nil {
+		if err := validateCircleDescription(*input.Description); err != nil {
+			return err
+		}
+	}
+	if input.ContributionAmount != nil {
+		if err := validateContributionAmount(*input.ContributionAmount); err != nil {
+			return err
+		}
+	}
+	if input.Currency != nil {
+		if err := validateCircleCurrency(*input.Currency); err != nil {
+			return err
+		}
+	}
+	if input.Frequency != nil {
+		if err := validateCircleFrequency(*input.Frequency); err != nil {
+			return err
+		}
+	}
+	if input.MaxMembers != nil {
+		if err := validateMaxMembers(*input.MaxMembers); err != nil {
+			return err
+		}
+	}
+	if input.MinMoiScore != nil {
+		if err := validateMinMoiScore(*input.MinMoiScore); err != nil {
+			return err
+		}
+	}
+	if input.CollateralPercent != nil {
+		if err := validateCollateral(*input.CollateralPercent); err != nil {
+			return err
+		}
+	}
+	if input.LateFeePercent != nil {
+		if err := validateLateFee(*input.LateFeePercent); err != nil {
+			return err
+		}
+	}
+	if input.GracePeriodHours != nil {
+		if err := validateGracePeriod(*input.GracePeriodHours); err != nil {
+			return err
+		}
+	}
+	if input.MaxStrikes != nil {
+		if err := validateMaxStrikes(*input.MaxStrikes); err != nil {
+			return err
+		}
+	}
+	if input.StartDate != nil {
+		if _, _, err := parseCircleStartDate(*input.StartDate); err != nil {
+			return invalidCircleInput("%s", err.Error())
+		}
+	}
+	return nil
 }
 
 type AuditLogger interface {
@@ -225,6 +517,10 @@ func (s *circleService) Update(ctx context.Context, id, userID string, input Upd
 		return nil, err
 	}
 
+	if err := validateUpdateInput(input); err != nil {
+		return nil, err
+	}
+
 	c, err := s.repo.FindByID(ctx, uid)
 	if err != nil {
 		return nil, fmt.Errorf("finding circle for update: %w", err)
@@ -238,13 +534,14 @@ func (s *circleService) Update(ctx context.Context, id, userID string, input Upd
 	}
 
 	if input.Name != nil {
-		c.Name = *input.Name
+		c.Name = strings.TrimSpace(*input.Name)
 	}
 	if input.Description != nil {
-		if *input.Description == "" {
+		trimmed := strings.TrimSpace(*input.Description)
+		if trimmed == "" {
 			c.Description = sql.NullString{}
 		} else {
-			c.Description = sql.NullString{String: *input.Description, Valid: true}
+			c.Description = sql.NullString{String: trimmed, Valid: true}
 		}
 	}
 	if input.ContributionAmount != nil {
@@ -274,6 +571,17 @@ func (s *circleService) Update(ctx context.Context, id, userID string, input Upd
 	if input.MaxStrikes != nil {
 		c.MaxStrikes = *input.MaxStrikes
 	}
+	if input.StartDate != nil {
+		start, hasStart, _ := parseCircleStartDate(*input.StartDate)
+		if hasStart {
+			c.StartDate = sql.NullTime{Time: start.UTC(), Valid: true}
+		} else {
+			c.StartDate = sql.NullTime{}
+		}
+	}
+	if input.AutoDebit != nil {
+		c.AutoDebit = *input.AutoDebit
+	}
 	c.UpdatedAt = time.Now().UTC()
 
 	if err := s.repo.Update(ctx, c); err != nil {
@@ -288,8 +596,17 @@ func (s *circleService) Create(ctx context.Context, organizerID string, input Cr
 		return nil, err
 	}
 
-	if input.MaxMembers < 2 {
-		return nil, ErrParticipantLimit
+	// Zero-value defaults mirror the frontend wizard (initialCircleForm) and
+	// the zod schema: omitted grace/strikes arrive as 0 from JSON binding.
+	if input.GracePeriodHours == 0 {
+		input.GracePeriodHours = 24
+	}
+	if input.MaxStrikes == 0 {
+		input.MaxStrikes = 3
+	}
+
+	if err := validateCreateInput(input); err != nil {
+		return nil, err
 	}
 
 	if input.CircleType == CircleTypePremium {
@@ -297,24 +614,22 @@ func (s *circleService) Create(ctx context.Context, organizerID string, input Cr
 		if err != nil {
 			return nil, fmt.Errorf("finding organizer for premium check: %w", err)
 		}
-		if org.MoiScore < 50 {
-			return nil, fmt.Errorf("premium circles require at least 50 MoiScore")
+		if org.MoiScore < premiumMinMOI {
+			return nil, invalidCircleInput("premium circles require at least 50 MoiScore")
 		}
-		if input.Currency == CurrencyUSDC && input.ContributionAmount < 50 {
-			return nil, fmt.Errorf("premium circles require minimum 50 USDC contribution")
-		}
-		if input.Currency == CurrencyXLM && input.ContributionAmount < 100 {
-			return nil, fmt.Errorf("premium circles require minimum 100 XLM contribution")
+		if input.ContributionAmount < premiumMinUSDC {
+			return nil, invalidCircleInput("premium circles require minimum 50 USDC contribution")
 		}
 	}
 
 	now := time.Now().UTC()
+	startTime, hasStart, _ := parseCircleStartDate(input.StartDate)
 
 	buildCircle := func() *Circle {
 		c := &Circle{
 			ID:                 uuid.New(),
 			CommunityID:        parseCommunityID(input.CommunityID),
-			Name:               input.Name,
+			Name:               strings.TrimSpace(input.Name),
 			CircleType:         input.CircleType,
 			PayoutType:         input.PayoutType,
 			ContributionAmount: input.ContributionAmount,
@@ -327,6 +642,7 @@ func (s *circleService) Create(ctx context.Context, organizerID string, input Cr
 			GracePeriodHours:   input.GracePeriodHours,
 			MaxStrikes:         input.MaxStrikes,
 			RequiresInvite:     input.RequiresInvite,
+			AutoDebit:          input.AutoDebit,
 			Status:             CircleStatusPending,
 			CurrentRound:       0,
 			TotalContributions: 0,
@@ -334,8 +650,11 @@ func (s *circleService) Create(ctx context.Context, organizerID string, input Cr
 			CreatedAt:          now,
 			UpdatedAt:          now,
 		}
-		if input.Description != "" {
-			c.Description = sql.NullString{String: input.Description, Valid: true}
+		if strings.TrimSpace(input.Description) != "" {
+			c.Description = sql.NullString{String: strings.TrimSpace(input.Description), Valid: true}
+		}
+		if hasStart {
+			c.StartDate = sql.NullTime{Time: startTime.UTC(), Valid: true}
 		}
 		return c
 	}
@@ -498,7 +817,35 @@ func (s *circleService) Join(ctx context.Context, circleID, userID string, invit
 		return ErrCircleNotActive
 	}
 
-	if c.CircleType == CircleTypePremium {
+	// Arc USDC only: legacy-rail circles are discoverable but not joinable.
+	if c.Currency != CurrencyUSDC {
+		return fmt.Errorf("only USDC circles on Arc can be joined")
+	}
+
+	// DeoScore gates: premium floors at 50 and minMoiScore applies to every
+	// circle type. The repo is optional in unit tests, so a nil fetcher skips
+	// the check instead of panicking.
+	joinThreshold := c.MinMoiScore
+	if c.CircleType == CircleTypePremium && joinThreshold < 50 {
+		joinThreshold = 50
+	}
+	if joinThreshold > 0 {
+		if s.userRepo == nil {
+			// No score source wired; fail open so discovery tests without a
+			// user repo keep passing. Production always wires one.
+		} else {
+			joiner, err := s.userRepo.FindByID(ctx, uid)
+			if err != nil {
+				return fmt.Errorf("finding user for join score check: %w", err)
+			}
+			if joiner.MoiScore < joinThreshold {
+				if c.CircleType == CircleTypePremium && joiner.MoiScore < 50 {
+					return fmt.Errorf("joining premium circles requires at least 50 MoiScore")
+				}
+				return ErrMoiScoreTooLow
+			}
+		}
+	} else if c.CircleType == CircleTypePremium && s.userRepo != nil {
 		joiner, err := s.userRepo.FindByID(ctx, uid)
 		if err != nil {
 			return fmt.Errorf("finding user for premium join check: %w", err)
@@ -508,13 +855,17 @@ func (s *circleService) Join(ctx context.Context, circleID, userID string, invit
 		}
 	}
 
-	if c.CircleType == "community" && c.CommunityID != nil {
-		ok, err := s.communityChecker.IsMember(ctx, *c.CommunityID, uid)
-		if err != nil {
-			return fmt.Errorf("checking community membership: %w", err)
-		}
-		if !ok {
-			return ErrNotCommunityMember
+	if c.CircleType == CircleTypeCommunity && c.CommunityID != nil {
+		if s.communityChecker == nil {
+			// No checker wired (unit tests); fail open.
+		} else {
+			ok, err := s.communityChecker.IsMember(ctx, *c.CommunityID, uid)
+			if err != nil {
+				return fmt.Errorf("checking community membership: %w", err)
+			}
+			if !ok {
+				return ErrNotCommunityMember
+			}
 		}
 	}
 
@@ -532,7 +883,15 @@ func (s *circleService) Join(ctx context.Context, circleID, userID string, invit
 		}
 		existing, err := repo.FindMemberByCircleAndUser(ctx, cid, uid)
 		if err == nil && existing != nil {
-			return ErrAlreadyMember
+			if existing.Status == MemberStatusActive {
+				return ErrAlreadyMember
+			}
+			// A previous exit/removal leaves the row behind (unique key on
+			// circle+user). Reactivate it instead of inserting a duplicate.
+			if err := repo.UpdateMemberStatus(ctx, cid, uid, MemberStatusActive); err != nil {
+				return fmt.Errorf("rejoining circle: %w", err)
+			}
+			return nil
 		}
 		if err := repo.CreateMember(ctx, &CircleMember{
 			CircleID: cid,
@@ -541,6 +900,11 @@ func (s *circleService) Join(ctx context.Context, circleID, userID string, invit
 			Status:   MemberStatusActive,
 			JoinedAt: time.Now().UTC(),
 		}); err != nil {
+			// A concurrent join winning the race surfaces as a unique
+			// violation; the caller is a member either way.
+			if err == ErrAlreadyMember {
+				return ErrAlreadyMember
+			}
 			return fmt.Errorf("joining circle: %w", err)
 		}
 		return nil

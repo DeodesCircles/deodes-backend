@@ -10,9 +10,10 @@ import (
 type CircleType string
 
 const (
-	CircleTypePublic  CircleType = "public"
-	CircleTypePrivate CircleType = "private"
-	CircleTypePremium CircleType = "premium"
+	CircleTypePublic    CircleType = "public"
+	CircleTypePrivate   CircleType = "private"
+	CircleTypeCommunity CircleType = "community"
+	CircleTypePremium   CircleType = "premium"
 )
 
 type PayoutType string
@@ -76,15 +77,18 @@ type Circle struct {
 	MaxStrikes         int             `json:"maxStrikes" db:"max_strikes"`
 	MemberCount        int             `json:"memberCount" db:"member_count"`
 	RequiresInvite     bool            `json:"requiresInvite" db:"requires_invite"`
-	StartDate          sql.NullTime    `json:"startDate,omitempty" db:"start_date"`
-	EndDate            sql.NullTime    `json:"endDate,omitempty" db:"end_date"`
-	Status             CircleStatus    `json:"status" db:"status"`
-	CurrentRound       int             `json:"currentRound" db:"current_round"`
-	TotalContributions float64         `json:"totalContributions" db:"total_contributions"`
-	OrganizerID        uuid.UUID       `json:"organizerId" db:"organizer_id"`
-	CreatedAt          time.Time       `json:"createdAt" db:"created_at"`
-	UpdatedAt          time.Time       `json:"updatedAt" db:"updated_at"`
-	DeletedAt          *time.Time      `json:"deletedAt,omitempty" db:"deleted_at"`
+	// AutoDebit marks Auto circles: members consent once and the keeper pulls
+	// each round. Flexible circles (false) stay manual. See migration 053.
+	AutoDebit          bool         `json:"autoDebit" db:"auto_debit"`
+	StartDate          sql.NullTime `json:"startDate,omitempty" db:"start_date"`
+	EndDate            sql.NullTime `json:"endDate,omitempty" db:"end_date"`
+	Status             CircleStatus `json:"status" db:"status"`
+	CurrentRound       int          `json:"currentRound" db:"current_round"`
+	TotalContributions float64      `json:"totalContributions" db:"total_contributions"`
+	OrganizerID        uuid.UUID    `json:"organizerId" db:"organizer_id"`
+	CreatedAt          time.Time    `json:"createdAt" db:"created_at"`
+	UpdatedAt          time.Time    `json:"updatedAt" db:"updated_at"`
+	DeletedAt          *time.Time   `json:"deletedAt,omitempty" db:"deleted_at"`
 }
 
 type CircleMember struct {

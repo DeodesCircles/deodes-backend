@@ -45,6 +45,28 @@ func TestSavingsHandler_Create_Valid(t *testing.T) {
 	repo.AssertExpectations(t)
 }
 
+func TestSavingsHandler_Create_BlankName_MapsToBadRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	repo := new(savingsMocks.Repository)
+	svc := savings.NewService(repo)
+	h := handler.NewSavingsGoalHandler(svc)
+	r := gin.New()
+	r.Use(func(c *gin.Context) { c.Set("userID", "user-1"); c.Next() })
+	r.POST("/savings/goals", h.Create)
+
+	// Passes gin binding (name present, target > 0) but fails service
+	// validation — must still be a 400, not a 500.
+	body, _ := json.Marshal(map[string]interface{}{"name": "   ", "targetAmount": 2000})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/savings/goals", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	repo.AssertNotCalled(t, "Create", mock.Anything, mock.Anything)
+}
+
 func TestSavingsHandler_Create_MissingName(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -217,4 +239,51 @@ func TestSavingsHandler_Summary(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), `"totalGoals":2`)
 	repo.AssertExpectations(t)
+}
+
+func TestSavingsHandler_Unauthenticated(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	repo := new(savingsMocks.Repository)
+	svc := savings.NewService(repo)
+	h := handler.NewSavingsGoalHandler(svc)
+	// No userID set — simulates the handler mounted without auth.
+	r := gin.New()
+	r.GET("/savings/goals", h.List)
+	r.GET("/savings/goals/:id", h.Get)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/savings/goals", nil)
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/savings/goals/goal-1", nil)
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	repo.AssertNotCalled(t, "FindByUserID", mock.Anything, mock.Anything)
+	repo.AssertNotCalled(t, "FindByID", mock.Anything, mock.Anything)
+}
+
+func TestSavingsHandler_Update_InvalidStatus_MapsToBadRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	repo := new(savingsMocks.Repository)
+	svc := savings.NewService(repo)
+
+	repo.On("FindByID", mock.Anything, "goal-1").Return(&savings.SavingsGoal{ID: "goal-1", UserID: "user-1", Name: "Trip"}, nil)
+
+	h := handler.NewSavingsGoalHandler(svc)
+	r := gin.New()
+	r.Use(func(c *gin.Context) { c.Set("userID", "user-1"); c.Next() })
+	r.PATCH("/savings/goals/:id", h.Update)
+
+	body, _ := json.Marshal(map[string]interface{}{"status": "archived"})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("PATCH", "/savings/goals/goal-1", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	repo.AssertNotCalled(t, "Update", mock.Anything, mock.Anything)
 }

@@ -2,6 +2,33 @@ package savings
 
 import "time"
 
+// ValidGoalStatuses mirrors the CHECK constraint in migration
+// 027_savings_goals (status IN ('active', 'completed', 'cancelled')).
+var ValidGoalStatuses = map[string]bool{
+	"active":    true,
+	"completed": true,
+	"cancelled": true,
+}
+
+// IsValidStatus reports whether s is a persistable goal status.
+func IsValidStatus(s string) bool {
+	return ValidGoalStatuses[s]
+}
+
+// ParseTargetDate validates the optional YYYY-MM-DD deadline accepted by
+// CreateGoalRequest/UpdateGoalRequest. A nil or empty value means "no
+// deadline" and is valid; anything else must be a real calendar date.
+func ParseTargetDate(s *string) (time.Time, bool, error) {
+	if s == nil || *s == "" {
+		return time.Time{}, false, nil
+	}
+	t, err := time.Parse("2006-01-02", *s)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return t, true, nil
+}
+
 type SavingsGoal struct {
 	ID            string    `json:"id" db:"id"`
 	UserID        string    `json:"userId" db:"user_id"`

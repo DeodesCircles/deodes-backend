@@ -52,7 +52,7 @@ func (h *SavingsGoalHandler) Create(c *gin.Context) {
 	}
 	var req savings.CreateGoalRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		response.ValidationError(c, err.Error(), nil)
 		return
 	}
 	goal, err := h.svc.CreateGoal(c.Request.Context(), userID, req)
@@ -111,7 +111,7 @@ func (h *SavingsGoalHandler) Update(c *gin.Context) {
 	goalID := c.Param("id")
 	var req savings.UpdateGoalRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		response.ValidationError(c, err.Error(), nil)
 		return
 	}
 	goal, err := h.svc.UpdateGoal(c.Request.Context(), userID, goalID, req)

@@ -57,7 +57,7 @@ func TestSavingsService_CreateGoal_RepoError(t *testing.T) {
 
 	repo.On("Create", mock.Anything, mock.AnythingOfType("*savings.SavingsGoal")).Return(assert.AnError)
 
-	goal, err := svc.CreateGoal(ctx(), "user-1", savings.CreateGoalRequest{Name: "X", TargetAmount: 10})
+	goal, err := svc.CreateGoal(ctx(), "user-1", savings.CreateGoalRequest{Name: "Repo Fail Goal", TargetAmount: 10})
 
 	assert.Error(t, err)
 	assert.Nil(t, goal)

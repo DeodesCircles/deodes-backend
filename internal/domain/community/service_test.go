@@ -45,8 +45,29 @@ func TestCommunityService_Create_AddsOwnerAsAdmin(t *testing.T) {
 	repo.AssertExpectations(t)
 }
 
-func TestCommunityService_Create_SlugConflict(t *testing.T) {
+func TestCommunityService_Create_NilTagsDefaultToEmpty(t *testing.T) {
 	repo := new(communityMocks.Repository)
+	svc := community.NewService(repo, nil)
+	uid := uuid.New()
+
+	var created *community.Community
+	repo.On("Create", mock.Anything, mock.AnythingOfType("*community.Community")).
+		Run(func(args mock.Arguments) {
+			created = args.Get(1).(*community.Community)
+		}).
+		Return(nil)
+	repo.On("AddMember", mock.Anything, mock.AnythingOfType("*community.CommunityMember")).Return(nil)
+
+	c, err := svc.Create(ctx(), uid.String(), community.CreateCommunityInput{Name: "No Tags", Slug: "no-tags"})
+
+	assert.NoError(t, err)
+	assert.NotNil(t, c)
+	assert.NotNil(t, created.Tags, "nil tags must default to empty, the column is NOT NULL")
+	assert.Empty(t, created.Tags)
+	repo.AssertExpectations(t)
+}
+
+func TestCommunityService_Create_SlugConflict(t *testing.T) {	repo := new(communityMocks.Repository)
 	svc := community.NewService(repo, nil)
 	uid := uuid.New()
 

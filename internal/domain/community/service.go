@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 
 	"github.com/deodes/backend/pkg/apperrors"
 )
@@ -65,13 +66,19 @@ func (s *communityService) Create(ctx context.Context, userID string, input Crea
 	}
 
 	now := time.Now().UTC()
+	tags := input.Tags
+	if tags == nil {
+		// pq serializes a nil StringArray as NULL, but tags is NOT NULL —
+		// default to empty so tag-less communities don't 500.
+		tags = pq.StringArray{}
+	}
 	c := &Community{
 		ID:          uuid.New(),
 		Name:        input.Name,
 		Slug:        input.Slug,
 		Description: input.Description,
 		Category:    input.Category,
-		Tags:        input.Tags,
+		Tags:        tags,
 		OwnerID:     ownerID,
 		MemberCount: 1,
 		IsFeatured:  false,
